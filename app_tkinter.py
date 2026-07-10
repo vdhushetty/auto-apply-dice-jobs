@@ -1,6 +1,7 @@
 # dice_auto_apply/app_tkinter.py
 
 import os
+import queue
 import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -755,27 +756,34 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
         # Disable button during testing
         self.test_login_button.config(state="disabled", text="Testing...")
         self.root.update_idletasks()
+        result_queue = queue.Queue(maxsize=1)
+        deadline = time.monotonic() + 180
+
+        def poll_login_result():
+            try:
+                success, error_message = result_queue.get_nowait()
+            except queue.Empty:
+                if time.monotonic() >= deadline:
+                    self.test_login_complete(False, "Login test timed out.")
+                    return
+                self.root.after(100, poll_login_result)
+                return
+            self.test_login_complete(success, error_message)
         
         def test_login_thread():
             try:
                 # Import the validation function
                 
                 success = validate_dice_credentials(username, password)
-                
-                # Update UI from the main thread
-                self.root.after(0, lambda: self.test_login_complete(success))
+                result_queue.put((success, None))
                 
             except Exception as e:
                 self.logger.error(f"Login test error: {str(e)}")
-                # Update UI from the main thread
-                error_message = str(e)
-                self.root.after(
-                    0,
-                    lambda message=error_message: self.test_login_complete(False, message),
-                )
+                result_queue.put((False, str(e)))
                 
         # Run the test in a separate thread
         threading.Thread(target=test_login_thread, daemon=True).start()
+        self.root.after(100, poll_login_result)
         
     def test_login_complete(self, success, error_msg=None):
         """Handle login test completion"""
