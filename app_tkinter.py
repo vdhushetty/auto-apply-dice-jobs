@@ -51,6 +51,7 @@ class DiceAutoBotApp:
         # Initialize variables
         self.driver = None
         self.job_thread = None
+        self.login_test_thread = None
         self.running = False
         
         # Load configuration if exists
@@ -746,6 +747,13 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             
     def test_login(self):
         """Test Dice login credentials"""
+        if self.login_test_thread is not None and self.login_test_thread.is_alive():
+            messagebox.showinfo(
+                "Login Test",
+                "The previous login check is still closing its browser. Please wait a moment.",
+            )
+            return
+
         username = self.username_entry.get().strip()
         password = self.password_entry.get().strip()
         
@@ -757,15 +765,26 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
         self.test_login_button.config(state="disabled", text="Testing...")
         self.root.update_idletasks()
         result_queue = queue.Queue(maxsize=1)
-        deadline = time.monotonic() + 180
+        deadline = time.monotonic() + 100
+        started_at = time.monotonic()
+        last_elapsed = -1
 
         def poll_login_result():
+            nonlocal last_elapsed
             try:
                 success, error_message = result_queue.get_nowait()
             except queue.Empty:
                 if time.monotonic() >= deadline:
-                    self.test_login_complete(False, "Login test timed out.")
+                    self.test_login_complete(
+                        False,
+                        "Login test timed out. Its browser is still being closed; "
+                        "wait a moment before retrying.",
+                    )
                     return
+                elapsed = int(time.monotonic() - started_at)
+                if elapsed != last_elapsed:
+                    self.test_login_button.config(text=f"Testing... {elapsed}s")
+                    last_elapsed = elapsed
                 self.root.after(100, poll_login_result)
                 return
             self.test_login_complete(success, error_message)
@@ -778,11 +797,14 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                 result_queue.put((success, None))
                 
             except Exception as e:
-                self.logger.error(f"Login test error: {str(e)}")
                 result_queue.put((False, str(e)))
                 
         # Run the test in a separate thread
-        threading.Thread(target=test_login_thread, daemon=True).start()
+        self.login_test_thread = threading.Thread(
+            target=test_login_thread,
+            daemon=True,
+        )
+        self.login_test_thread.start()
         self.root.after(100, poll_login_result)
         
     def test_login_complete(self, success, error_msg=None):

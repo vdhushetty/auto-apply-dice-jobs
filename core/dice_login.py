@@ -10,6 +10,42 @@ from selenium.webdriver.chrome.options import Options
 
 from core.authorization import require_dice_automation_authorized
 
+
+LOGIN_PAGE_URL = "https://www.dice.com/dashboard/login"
+ACCOUNT_PROFILE_URL = "https://www.dice.com/dashboard/profiles"
+
+
+def _profile_page_confirms_authenticated_session(
+    current_url,
+    body_text,
+    login_form_visible,
+    account_control_visible,
+):
+    """Return True only when Dice's protected profile page shows account-only content."""
+
+    normalized_url = (current_url or "").lower()
+    normalized_body = (body_text or "").lower()
+    if "/dashboard/profiles" not in normalized_url or login_form_visible:
+        return False
+    if any(
+        marker in normalized_body
+        for marker in (
+            "log in to continue",
+            "create an account or sign in",
+            "checking your session",
+        )
+    ):
+        return False
+    return account_control_visible or any(
+        marker in normalized_body
+        for marker in (
+            "my profile",
+            "profile visibility",
+            "upload resume",
+            "work experience",
+        )
+    )
+
 def update_dice_credentials(username, password, update_env=True):
     """
     Updates the Dice credentials in the .env file.
@@ -83,6 +119,7 @@ def get_headless_driver():
         options.binary_location = web_browser_path
     
     driver = webdriver.Chrome(options=options)
+    driver.set_page_load_timeout(25)
     return driver
 
 def validate_dice_credentials(username, password, headless=True):
@@ -115,69 +152,135 @@ def validate_dice_credentials(username, password, headless=True):
         options.binary_location = web_browser_path
         options.add_argument("--start-maximized")
         driver = webdriver.Chrome(options=options)
+        driver.set_page_load_timeout(25)
     
     try:
+        overall_deadline = time.monotonic() + 80
+
+        def wait_for(condition):
+            remaining = overall_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Dice login validation exceeded 80 seconds.")
+            return WebDriverWait(driver, min(20, remaining)).until(condition)
+
         # Try login with provided credentials
-        driver.get("https://www.dice.com/dashboard/login")
-        wait = WebDriverWait(driver, 20)       # Increased from 10 to 20
-        long_wait = WebDriverWait(driver, 120) # Much longer wait for final verification
+        driver.get(LOGIN_PAGE_URL)
         
         # Enter email/username
-        email_field = wait.until(EC.presence_of_element_located((By.NAME, "email")))
+        email_field = wait_for(EC.presence_of_element_located((By.NAME, "email")))
         email_field.clear()
         email_field.send_keys(username)
         
         # Click continue
-        continue_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[@data-testid='sign-in-button']")))
+        continue_button = wait_for(
+            EC.element_to_be_clickable(
+                (By.XPATH, "//button[@data-testid='sign-in-button']")
+            )
+        )
         continue_button.click()
-        time.sleep(3)  # Increased pause
         
         # Enter password
-        password_field = wait.until(EC.presence_of_element_located((By.NAME, "password")))
+        password_field = wait_for(
+            EC.presence_of_element_located((By.NAME, "password"))
+        )
         password_field.clear()
         password_field.send_keys(password)
         
         # Click login button
-        login_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[@data-testid='submit-password']")))
+        login_button = wait_for(
+            EC.element_to_be_clickable(
+                (By.XPATH, "//button[@data-testid='submit-password']")
+            )
+        )
         login_button.click()
         
-        # Add a longer pause after clicking login
-        time.sleep(10)  # Increased wait time
-        
-        # Check for successful login using multiple methods
-        try:
-            # Method 1: Check for search form
-            long_wait.until(EC.presence_of_element_located((By.XPATH, "//form[@class='flex h-auto w-full flex-row rounded-lg rounded-bl-lg bg-white']")))
-            print("Login successful with provided credentials!")
-            return True
-        except Exception:
-            try:
-                # Method 2: Check for dashboard header
-                long_wait.until(EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'dashboard-header')]")))
+        # Wait for Dice to finish the sign-in response, but do not treat a public job-search
+        # page as proof of authentication.
+        error_selectors = (
+            '[role="alert"]',
+            '[data-testid*="error"]',
+            '.error-message',
+            '.alert-danger',
+        )
+        transition_deadline = min(overall_deadline - 20, time.monotonic() + 30)
+        while time.monotonic() < transition_deadline:
+            current_url = (driver.current_url or "").lower()
+            if not any(
+                marker in current_url for marker in ("/login", "/signin", "/sign-in")
+            ):
+                break
+            visible_errors = [
+                (element.text or "").strip().lower()
+                for selector in error_selectors
+                for element in driver.find_elements(By.CSS_SELECTOR, selector)
+                if element.is_displayed()
+            ]
+            if any(
+                any(
+                    word in message
+                    for word in (
+                        "invalid",
+                        "incorrect",
+                        "failed",
+                        "locked",
+                        "not recognized",
+                    )
+                )
+                for message in visible_errors
+            ):
+                print("Login failed: Dice rejected the credentials.")
+                return False
+            time.sleep(0.5)
+
+        # Verify against Dice's protected profile page. Public search forms and URL changes
+        # alone are not sufficient evidence that Dice accepted the account session.
+        remaining = overall_deadline - time.monotonic()
+        if remaining <= 0:
+            print("Login failed: Dice login validation exceeded 80 seconds.")
+            return False
+        driver.set_page_load_timeout(max(1, min(25, remaining)))
+        driver.get(ACCOUNT_PROFILE_URL)
+        while time.monotonic() < overall_deadline:
+            account_control_visible = any(
+                element.is_displayed()
+                for selector in (
+                    '[data-testid="user-menu"]',
+                    '[data-testid="profile-menu"]',
+                    'button[aria-label*="account" i]',
+                    'button[aria-label*="profile" i]',
+                )
+                for element in driver.find_elements(By.CSS_SELECTOR, selector)
+            )
+            login_form_visible = any(
+                element.is_displayed()
+                for selector in ('input[name="email"]', 'input[name="password"]')
+                for element in driver.find_elements(By.CSS_SELECTOR, selector)
+            )
+            body_elements = driver.find_elements(By.TAG_NAME, "body")
+            body_text = body_elements[0].text if body_elements else ""
+            if _profile_page_confirms_authenticated_session(
+                driver.current_url,
+                body_text,
+                login_form_visible,
+                account_control_visible,
+            ):
                 print("Login successful with provided credentials!")
                 return True
-            except Exception:
-                # Method 3: Check URL change
-                current_url = driver.current_url
-                if "dashboard" in current_url or "/home" in current_url or "/jobs" in current_url:
-                    print("Login successful with provided credentials!")
-                    return True
-                
-                # Look for error messages
-                try:
-                    error_message = wait.until(EC.presence_of_element_located(
-                        (By.XPATH, "//div[contains(@class, 'error-message') or contains(@class, 'alert-danger')]")))
-                    print(f"Login failed: {error_message.text}")
-                except Exception:
-                    print("Login failed: Could not verify login result")
-                
+            if login_form_visible and "/login" in (driver.current_url or "").lower():
+                print("Login failed: Dice returned to the sign-in page.")
                 return False
+            time.sleep(0.5)
+        print("Login failed: Dice did not confirm an authenticated session within 80 seconds.")
+        return False
             
     except Exception as e:
         print(f"Error validating credentials: {e}")
         return False
     finally:
-        driver.quit()
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
 
 def login_to_dice(driver, credentials_from_params=None):
