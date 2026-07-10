@@ -7,8 +7,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from dotenv import load_dotenv, set_key, find_dotenv
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
+
+from core.authorization import require_dice_automation_authorized
 
 def update_dice_credentials(username, password, update_env=True):
     """
@@ -33,7 +33,7 @@ def update_dice_credentials(username, password, update_env=True):
             if not dotenv_path:
                 dotenv_path = os.path.join(os.getcwd(), '.env')
                 Path(dotenv_path).touch(exist_ok=True)
-                print(f"Created new .env file at {dotenv_path}")
+                print("Created a local .env file.")
             
             # Load existing .env file
             load_dotenv(dotenv_path)
@@ -41,6 +41,8 @@ def update_dice_credentials(username, password, update_env=True):
             # Update credentials in .env file
             set_key(dotenv_path, "DICE_USERNAME", username)
             set_key(dotenv_path, "DICE_PASSWORD", password)
+            if os.name != "nt":
+                os.chmod(dotenv_path, 0o600)
             print("Dice credentials updated in .env file.")
         
         # Set the environment variables for current session
@@ -61,7 +63,7 @@ def get_headless_driver():
     """
     try:
         # Import browser detector if available
-        from browser_detector import get_browser_path
+        from core.browser_detector import get_browser_path
         web_browser_path = get_browser_path()
     except ImportError:
         # Fallback if browser_detector is not available
@@ -75,13 +77,12 @@ def get_headless_driver():
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--no-sandbox")
     
     # Set browser binary location if available
     if web_browser_path:
         options.binary_location = web_browser_path
     
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    driver = webdriver.Chrome(options=options)
     return driver
 
 def validate_dice_credentials(username, password, headless=True):
@@ -97,24 +98,23 @@ def validate_dice_credentials(username, password, headless=True):
     Returns:
         bool: True if login was successful, False otherwise
     """
-    print(f"Validating credentials for {username}...")
+    require_dice_automation_authorized()
+    print("Validating Dice credentials...")
     
     # Create driver (headless or regular)
     if headless:
         driver = get_headless_driver()
     else:
         # Import from main file to get regular driver
-        from browser_detector import get_browser_path
+        from core.browser_detector import get_browser_path
         from selenium import webdriver
         from selenium.webdriver.chrome.options import Options
-        from selenium.webdriver.chrome.service import Service
-        from webdriver_manager.chrome import ChromeDriverManager
         
         web_browser_path = get_browser_path()
         options = Options()
         options.binary_location = web_browser_path
         options.add_argument("--start-maximized")
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+        driver = webdriver.Chrome(options=options)
     
     try:
         # Try login with provided credentials
@@ -192,6 +192,7 @@ def login_to_dice(driver, credentials_from_params=None):
     Returns:
         bool: True if login is successful, False otherwise.
     """
+    require_dice_automation_authorized()
     # Load credentials from parameters or environment
     if credentials_from_params and len(credentials_from_params) == 2:
         username, password = credentials_from_params

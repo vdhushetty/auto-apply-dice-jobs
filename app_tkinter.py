@@ -3,44 +3,26 @@
 import os
 import sys
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 import threading
+import json
 import pandas as pd
 from datetime import datetime
 import time
 import logging
-import pyautogui
 import subprocess
 
-# Try both absolute and relative imports for compatibility
-try:
-    from core.browser_detector import get_browser_path
-    from core.dice_login import login_to_dice, update_dice_credentials, validate_dice_credentials
-    from core.main_script import get_web_driver, fetch_jobs_with_requests, apply_to_job_url
-except ImportError:
-    try:
-        from core.browser_detector import get_browser_path
-        from core.dice_login import login_to_dice, update_dice_credentials, validate_dice_credentials
-        from core.main_script import get_web_driver, fetch_jobs_with_requests, apply_to_job_url
-    except ImportError:
-        from core.browser_detector import get_browser_path
-        from core.dice_login import login_to_dice, update_dice_credentials, validate_dice_credentials
-        from core.main_script import get_web_driver, fetch_jobs_with_requests, apply_to_job_url
-
-
-
-def fix_imports():
-    """Fix imports for both development and packaged environments"""
-    import os
-    import sys
-    
-    # Add the parent directory to the path if not already there
-    parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if parent_dir not in sys.path:
-        sys.path.insert(0, parent_dir)
-
-# Call this at the beginning of your script
-fix_imports()
+from core.authorization import DiceAuthorizationError, require_dice_automation_authorized
+from core.dice_login import login_to_dice, update_dice_credentials, validate_dice_credentials
+from core.main_script import (
+    ApplicationStatus,
+    RunMode,
+    apply_to_job_url,
+    fetch_jobs_with_requests,
+    get_web_driver,
+)
+from core.resumes import ResumeService, inspect_resume_catalog
+from core.resumes.models import CloudProfile, ResumeError
 
 class DiceAutoBotApp:
     def __init__(self, root):
@@ -61,9 +43,6 @@ class DiceAutoBotApp:
                     self.root.iconphoto(True, img)
         except Exception as e:
             pass
-        
-        # Disable PyAutoGUI failsafe
-        pyautogui.FAILSAFE = False
         
         # Configure logging
         self.setup_logging()
@@ -124,6 +103,7 @@ class DiceAutoBotApp:
         """Load configuration from config file"""
         self.config_dir = os.path.join(os.path.dirname(__file__), "config")
         self.config_file = os.path.join(self.config_dir, "settings.json")
+        self.local_config_file = os.path.join(self.config_dir, "settings.local.json")
         
         # Default values
         self.search_queries = ["AI ML", "Gen AI", "Agentic AI", "Data Engineer", "Data Analyst", "Machine Learning"]
@@ -133,22 +113,49 @@ class DiceAutoBotApp:
         "Natural Language Processing","analyst","scientist","senior","cloud", 
         "aws","gcp","Azure","agentic","python","rag","llm"]
         self.headless_mode = False
-        self.job_limit = 1500
+        self.job_limit = 25
+        self.run_mode = "preview"
+        self.resume_mode = "static"
+        self.resume_paths = {"aws": "", "azure": "", "gcp": ""}
+        self.minimum_match_score = 35
+        self.minimum_winner_margin = 5
+        self.tailored_resume_output_dir = ".data/tailored_resumes"
         
         # Try to load from file if it exists
         import json
-        if os.path.exists(self.config_file):
+        config = {}
+        for path in (self.config_file, self.local_config_file):
+            if not os.path.exists(path):
+                continue
             try:
-                with open(self.config_file, 'r') as f:
-                    config = json.load(f)
-                    self.search_queries = config.get('search_queries', self.search_queries)
-                    self.exclude_keywords = config.get('exclude_keywords', self.exclude_keywords)
-                    self.include_keywords = config.get('include_keywords', self.include_keywords)
-                    self.headless_mode = config.get('headless_mode', self.headless_mode)
-                    self.job_limit = config.get('job_application_limit', self.job_limit)
-                    self.logger.info("Configuration loaded successfully")
+                with open(path, "r", encoding="utf-8") as config_file:
+                    loaded = json.load(config_file)
+                    if isinstance(loaded, dict):
+                        config.update(loaded)
             except Exception as e:
-                self.logger.error(f"Error loading configuration: {e}")
+                self.logger.error(f"Error loading configuration file {path}: {e}")
+        self.search_queries = config.get("search_queries", self.search_queries)
+        self.exclude_keywords = config.get("exclude_keywords", self.exclude_keywords)
+        self.include_keywords = config.get("include_keywords", self.include_keywords)
+        self.headless_mode = config.get("headless_mode", self.headless_mode)
+        self.job_limit = config.get("job_application_limit", self.job_limit)
+        self.run_mode = config.get("run_mode", self.run_mode)
+        self.resume_mode = config.get("resume_mode", self.resume_mode)
+        raw_paths = config.get("resume_paths", self.resume_paths)
+        if isinstance(raw_paths, dict):
+            self.resume_paths.update(
+                {profile: str(raw_paths.get(profile, "")) for profile in self.resume_paths}
+            )
+        self.minimum_match_score = config.get(
+            "minimum_match_score", self.minimum_match_score
+        )
+        self.minimum_winner_margin = config.get(
+            "minimum_winner_margin", self.minimum_winner_margin
+        )
+        self.tailored_resume_output_dir = config.get(
+            "tailored_resume_output_dir", self.tailored_resume_output_dir
+        )
+        self.logger.info("Configuration loaded successfully")
         
     def save_config(self):
         """Save configuration to config file"""
@@ -156,24 +163,38 @@ class DiceAutoBotApp:
         if not os.path.exists(self.config_dir):
             os.makedirs(self.config_dir)
             
-        import json
         try:
             config = {
                 'search_queries': [q.strip() for q in self.search_query_entry.get().split(',') if q.strip()],
                 'exclude_keywords': [k.strip() for k in self.exclude_keywords_entry.get().split(',') if k.strip()],
                 'include_keywords': [k.strip() for k in self.include_keywords_entry.get().split(',') if k.strip()],
                 'headless_mode': self.headless_var.get(),
-                'job_application_limit': self.job_limit_var.get()
+                'job_application_limit': self.job_limit_var.get(),
+                'run_mode': self.run_mode_var.get(),
+                'resume_mode': self.resume_mode_var.get(),
+                'resume_paths': {
+                    profile: variable.get().strip()
+                    for profile, variable in self.resume_path_vars.items()
+                },
+                'minimum_match_score': self.minimum_match_score_var.get(),
+                'minimum_winner_margin': self.minimum_winner_margin_var.get(),
+                'tailored_resume_output_dir': self.tailored_resume_output_dir,
             }
             
-            with open(self.config_file, 'w') as f:
+            temporary_config = f"{self.local_config_file}.tmp"
+            with open(temporary_config, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.name != "nt":
+                os.chmod(temporary_config, 0o600)
+            os.replace(temporary_config, self.local_config_file)
                 
             # Update credentials in .env file
             username = self.username_entry.get()
             password = self.password_entry.get()
             
-            if username and password:
+            if self.persist_credentials_var.get() and username and password:
                 update_dice_credentials(username, password)
                 
             messagebox.showinfo("Settings Saved", "Your settings have been saved successfully.")
@@ -214,7 +235,7 @@ class DiceAutoBotApp:
     def setup_main_tab(self):
         """Set up the main tab UI"""
         # Job queries section
-        query_frame = ttk.LabelFrame(self.main_tab, text="Job Titles to Apply:")
+        query_frame = ttk.LabelFrame(self.main_tab, text="Job Search Queries:")
         query_frame.pack(fill="x", padx=10, pady=10)
         
         # Search queries field
@@ -242,7 +263,7 @@ class DiceAutoBotApp:
         style = ttk.Style()
         style.configure("Green.TButton", background="gray", font=("Helvetica", 12))
         
-        self.start_button = ttk.Button(self.main_tab, text="Start Applying", command=self.start_applying, style="Green.TButton")
+        self.start_button = ttk.Button(self.main_tab, text="Start Preview", command=self.start_applying, style="Green.TButton")
         self.start_button.pack(fill="x", padx=10, pady=10)
         
         # Stop button
@@ -286,6 +307,18 @@ class DiceAutoBotApp:
         ttk.Label(stats_frame, text="Failed Applications:").grid(row=0, column=4, padx=5, pady=5)
         self.jobs_failed_label = ttk.Label(stats_frame, text="0")
         self.jobs_failed_label.grid(row=0, column=5, padx=5, pady=5)
+
+        ttk.Label(stats_frame, text="Jobs Skipped:").grid(row=0, column=6, padx=5, pady=5)
+        self.jobs_skipped_label = ttk.Label(stats_frame, text="0")
+        self.jobs_skipped_label.grid(row=0, column=7, padx=5, pady=5)
+
+        ttk.Label(stats_frame, text="Ready / Verified:").grid(row=1, column=0, padx=5, pady=5)
+        self.jobs_ready_label = ttk.Label(stats_frame, text="0")
+        self.jobs_ready_label.grid(row=1, column=1, padx=5, pady=5)
+
+        ttk.Label(stats_frame, text="Already Applied:").grid(row=1, column=2, padx=5, pady=5)
+        self.jobs_already_applied_label = ttk.Label(stats_frame, text="0")
+        self.jobs_already_applied_label.grid(row=1, column=3, padx=5, pady=5)
         
         # Excel Files section
         excel_frame = ttk.LabelFrame(self.main_tab, text="Excel Files")
@@ -367,6 +400,13 @@ class DiceAutoBotApp:
         ttk.Label(password_frame, text="Password:", width=15).pack(side="left")
         self.password_entry = ttk.Entry(password_frame, show="*", width=50)
         self.password_entry.pack(side="left", fill="x", expand=True)
+
+        self.persist_credentials_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            login_frame,
+            text="Save Dice credentials in the local ignored .env file",
+            variable=self.persist_credentials_var,
+        ).pack(anchor="w", padx=10, pady=3)
         
         # Test login button
         self.test_login_button = ttk.Button(login_frame, text="Test Login", command=self.test_login)
@@ -375,6 +415,26 @@ class DiceAutoBotApp:
         # Application settings
         settings_frame = ttk.LabelFrame(self.settings_tab, text="Application Settings")
         settings_frame.pack(fill="x", padx=10, pady=10)
+
+        run_mode_frame = ttk.Frame(settings_frame)
+        run_mode_frame.pack(fill="x", padx=10, pady=5)
+        ttk.Label(run_mode_frame, text="Run mode:", width=24).pack(side="left")
+        self.run_mode_var = tk.StringVar(value=self.run_mode)
+        run_mode_combo = ttk.Combobox(
+            run_mode_frame,
+            textvariable=self.run_mode_var,
+            values=("preview", "verify_upload", "submit"),
+            state="readonly",
+            width=18,
+        )
+        run_mode_combo.pack(side="left")
+        run_mode_combo.bind("<<ComboboxSelected>>", self.on_run_mode_changed)
+        self.run_mode_help_label = ttk.Label(
+            settings_frame,
+            text="Preview is the default and never clicks Apply.",
+            wraplength=760,
+        )
+        self.run_mode_help_label.pack(anchor="w", padx=10, pady=(0, 5))
         
         # Headless mode checkbox
         self.headless_var = tk.BooleanVar(value=self.headless_mode)
@@ -393,11 +453,94 @@ class DiceAutoBotApp:
         job_limit_spin = ttk.Spinbox(
             limit_frame, 
             from_=1, 
-            to=1000, 
+            to=100,
             width=5, 
             textvariable=self.job_limit_var
         )
         job_limit_spin.pack(side="left", padx=5)
+
+        resume_frame = ttk.LabelFrame(settings_frame, text="Resume Strategy")
+        resume_frame.pack(fill="x", padx=10, pady=10)
+
+        mode_row = ttk.Frame(resume_frame)
+        mode_row.pack(fill="x", padx=5, pady=4)
+        ttk.Label(mode_row, text="Mode:", width=16).pack(side="left")
+        self.resume_mode_var = tk.StringVar(value=self.resume_mode)
+        mode_combo = ttk.Combobox(
+            mode_row,
+            textvariable=self.resume_mode_var,
+            values=("static", "tailored"),
+            state="readonly",
+            width=18,
+        )
+        mode_combo.pack(side="left")
+        mode_combo.bind("<<ComboboxSelected>>", self.on_resume_mode_changed)
+
+        self.resume_path_vars = {
+            profile: tk.StringVar(value=self.resume_paths.get(profile, ""))
+            for profile in ("aws", "azure", "gcp")
+        }
+        for profile, variable in self.resume_path_vars.items():
+            row = ttk.Frame(resume_frame)
+            row.pack(fill="x", padx=5, pady=3)
+            ttk.Label(row, text=f"{profile.upper()} resume:", width=16).pack(side="left")
+            ttk.Entry(row, textvariable=variable).pack(
+                side="left", fill="x", expand=True, padx=(0, 5)
+            )
+            ttk.Button(
+                row,
+                text="Browse",
+                command=lambda selected_profile=profile: self.browse_resume_file(
+                    selected_profile
+                ),
+            ).pack(side="left")
+
+        threshold_row = ttk.Frame(resume_frame)
+        threshold_row.pack(fill="x", padx=5, pady=4)
+        ttk.Label(threshold_row, text="Minimum match:", width=16).pack(side="left")
+        self.minimum_match_score_var = tk.DoubleVar(value=self.minimum_match_score)
+        ttk.Spinbox(
+            threshold_row,
+            from_=0,
+            to=100,
+            increment=1,
+            width=6,
+            textvariable=self.minimum_match_score_var,
+        ).pack(side="left")
+        ttk.Label(threshold_row, text="% (lower matches are skipped)").pack(
+            side="left", padx=5
+        )
+
+        margin_row = ttk.Frame(resume_frame)
+        margin_row.pack(fill="x", padx=5, pady=4)
+        ttk.Label(margin_row, text="Winner margin:", width=16).pack(side="left")
+        self.minimum_winner_margin_var = tk.DoubleVar(value=self.minimum_winner_margin)
+        ttk.Spinbox(
+            margin_row,
+            from_=0,
+            to=25,
+            increment=1,
+            width=6,
+            textvariable=self.minimum_winner_margin_var,
+        ).pack(side="left")
+        ttk.Label(margin_row, text="points (close matches are skipped)").pack(
+            side="left", padx=5
+        )
+
+        ttk.Button(
+            resume_frame,
+            text="Validate Three Resumes",
+            command=self.validate_resume_catalog,
+        ).pack(anchor="w", padx=5, pady=5)
+
+        ttk.Label(
+            resume_frame,
+            text=(
+                "Tailored mode accepts DOCX only and reorders exact, candidate-authored "
+                "skills; it never invents qualifications."
+            ),
+            wraplength=760,
+        ).pack(anchor="w", padx=5, pady=(2, 5))
         
         # Save settings button
         self.save_settings_button = ttk.Button(
@@ -422,20 +565,23 @@ How to Use This Application
 1. Enter your Dice.com login credentials in the Settings tab and test them
 2. Enter job titles to search for (separated by commas)
 3. Optionally specify include/exclude keywords to filter results
-4. Click "Start Applying" to begin the automated job application process
+4. Configure and validate all three resume variants
+5. Run Preview first; it never clicks Apply
+6. Use Verify Upload for one supervised filename check
+7. Use Submit only after reviewing preview results
 
 Understanding Keywords
 --------------------
 
 Include Keywords: Jobs must contain at least one of these words in the title
 Exclude Keywords: Jobs containing any of these words will be skipped
+Resume Match: Jobs below the configured title + description score are skipped
 
 Finding Results
 -------------
 
-After the process completes, you can find:
-- applied_jobs.xlsx - List of jobs successfully applied to
-- not_applied_jobs.xlsx - List of jobs that couldn't be applied to
+After the process completes, consolidated run reports are under .data/runs/.
+Confirmed submissions are also appended to applied_jobs.xlsx.
         """
         self.guide_text.insert("1.0", guide_content)
         self.guide_text.config(state="disabled")  # Make it read-only
@@ -451,6 +597,103 @@ After the process completes, you can find:
             self.username_entry.insert(0, username)
         if password:
             self.password_entry.insert(0, password)
+        self.on_run_mode_changed()
+
+    def on_run_mode_changed(self, _event=None):
+        """Keep the primary action and side-effect warning aligned with run mode."""
+
+        mode = RunMode(self.run_mode_var.get())
+        labels = {
+            RunMode.PREVIEW: (
+                "Start Preview",
+                "Preview reads job details and scores resumes but never clicks Apply.",
+            ),
+            RunMode.VERIFY_UPLOAD: (
+                "Verify One Upload",
+                "Upload verification is limited to one job and never clicks Next or Submit; "
+                "Dice may retain a draft.",
+            ),
+            RunMode.SUBMIT: (
+                "Start Submitting",
+                "Submit mode may create external job applications after all safety checks pass.",
+            ),
+        }
+        button_text, help_text = labels[mode]
+        self.start_button.config(text=button_text)
+        self.run_mode_help_label.config(text=help_text)
+
+    def on_resume_mode_changed(self, _event=None):
+        """Prevent PDF choices from silently surviving into tailored mode."""
+
+        if self.resume_mode_var.get() != "tailored":
+            return
+        cleared = []
+        for profile, variable in self.resume_path_vars.items():
+            if variable.get().strip().lower().endswith(".pdf"):
+                variable.set("")
+                cleared.append(profile.upper())
+        if cleared:
+            messagebox.showwarning(
+                "DOCX Required",
+                "Tailored mode requires DOCX. Cleared PDF selections for: "
+                + ", ".join(cleared),
+            )
+
+    def browse_resume_file(self, profile):
+        """Select one local resume without copying it into the repository."""
+
+        if self.resume_mode_var.get() == "tailored":
+            filetypes = (("Word document", "*.docx"),)
+        else:
+            filetypes = (
+                ("Supported resumes", "*.docx *.pdf"),
+                ("Word document", "*.docx"),
+                ("PDF document", "*.pdf"),
+            )
+        selected = filedialog.askopenfilename(
+            title=f"Select {profile.upper()} resume",
+            filetypes=filetypes,
+        )
+        if selected:
+            self.resume_path_vars[profile].set(selected)
+
+    def validate_resume_catalog(self):
+        """Show privacy-safe compatibility diagnostics without Dice or OpenAI."""
+
+        paths = {
+            CloudProfile(profile): variable.get().strip()
+            for profile, variable in self.resume_path_vars.items()
+        }
+        try:
+            inspections = inspect_resume_catalog(paths)
+        except (ResumeError, ValueError, OSError) as exc:
+            messagebox.showerror("Resume Validation", str(exc))
+            return
+        lines = []
+        for inspection in inspections:
+            state = "tailored-ready" if inspection.tailored_compatible else "static-only"
+            lines.append(
+                f"{inspection.profile.value.upper()}: {inspection.format.upper()}, {state}, "
+                f"{inspection.skill_slot_count} skill slots / "
+                f"{inspection.skill_item_count} items, "
+                f"{len(inspection.technology_terms)} recognized terms"
+            )
+            lines.extend(f"  - {warning}" for warning in inspection.warnings)
+        messagebox.showinfo("Resume Validation", "\n".join(lines))
+
+    def resume_settings_snapshot(self):
+        """Capture Tk values on the UI thread before starting the worker."""
+
+        return {
+            "resume_mode": self.resume_mode_var.get(),
+            "resume_paths": {
+                profile: variable.get().strip()
+                for profile, variable in self.resume_path_vars.items()
+            },
+            "minimum_match_score": self.minimum_match_score_var.get(),
+            "minimum_winner_margin": self.minimum_winner_margin_var.get(),
+            "tailored_resume_output_dir": self.tailored_resume_output_dir,
+        }
         
     def setup_logs_tab(self):
         """Set up the logs tab UI"""
@@ -525,7 +768,11 @@ After the process completes, you can find:
             except Exception as e:
                 self.logger.error(f"Login test error: {str(e)}")
                 # Update UI from the main thread
-                self.root.after(0, lambda: self.test_login_complete(False, str(e)))
+                error_message = str(e)
+                self.root.after(
+                    0,
+                    lambda message=error_message: self.test_login_complete(False, message),
+                )
                 
         # Run the test in a separate thread
         threading.Thread(target=test_login_thread, daemon=True).start()
@@ -558,10 +805,69 @@ After the process completes, you can find:
             messagebox.showwarning("Missing Credentials", "Please enter Dice login credentials in the Settings tab.")
             self.notebook.select(1)  # Switch to settings tab
             return
+        try:
+            require_dice_automation_authorized()
+        except DiceAuthorizationError as exc:
+            messagebox.showerror(
+                "Dice Authorization Required",
+                str(exc),
+            )
+            return
             
         # Get keywords
         exclude_keywords = [k.strip() for k in self.exclude_keywords_entry.get().split(",") if k.strip()]
         include_keywords = [k.strip() for k in self.include_keywords_entry.get().split(",") if k.strip()]
+
+        resume_settings = self.resume_settings_snapshot()
+        try:
+            resume_service = ResumeService.from_settings(
+                resume_settings,
+                safety_identity=username,
+            )
+        except (ResumeError, ValueError, OSError) as exc:
+            messagebox.showerror("Resume Configuration", str(exc))
+            self.notebook.select(1)
+            return
+        run_mode = RunMode(self.run_mode_var.get())
+        headless = bool(self.headless_var.get())
+        try:
+            job_limit = int(self.job_limit_var.get())
+        except (TypeError, ValueError, tk.TclError):
+            messagebox.showerror("Job Limit", "Job limit must be a whole number from 1 to 100.")
+            return
+        if not 1 <= job_limit <= 100:
+            messagebox.showerror("Job Limit", "Job limit must be between 1 and 100.")
+            return
+        if run_mode is RunMode.VERIFY_UPLOAD:
+            job_limit = 1
+        if run_mode is not RunMode.PREVIEW and headless:
+            headless = False
+            messagebox.showinfo(
+                "Visible Browser Required",
+                "Upload verification and submission use a visible browser for supervision.",
+            )
+
+        confirmation = {
+            RunMode.PREVIEW: (
+                "Confirm Preview",
+                f"Inspect and score up to {job_limit} Dice jobs. Apply will never be clicked. Continue?",
+            ),
+            RunMode.VERIFY_UPLOAD: (
+                "Confirm One Upload Check",
+                "Open one eligible Easy Apply wizard and verify the selected resume filename. "
+                "Next and Submit will not be clicked, but Dice may retain a draft. Continue?",
+            ),
+            RunMode.SUBMIT: (
+                "Confirm External Submissions",
+                f"This run may submit up to {job_limit} Dice applications using "
+                f"{resume_settings['resume_mode']} resume mode. Continue?",
+            ),
+        }[run_mode]
+        if not messagebox.askyesno(
+            confirmation[0],
+            confirmation[1],
+        ):
+            return
         
         # Update UI
         self.running = True
@@ -574,6 +880,9 @@ After the process completes, you can find:
         self.jobs_found_label.config(text="0")
         self.jobs_applied_label.config(text="0")
         self.jobs_failed_label.config(text="0")
+        self.jobs_skipped_label.config(text="0")
+        self.jobs_ready_label.config(text="0")
+        self.jobs_already_applied_label.config(text="0")
         
         # Clear log text
         self.log_text.config(state="normal")
@@ -583,22 +892,45 @@ After the process completes, you can find:
         # Run job application process in a separate thread
         self.job_thread = threading.Thread(
             target=self.run_job_application,
-            args=(search_queries, include_keywords, exclude_keywords, username, password),
+            args=(
+                search_queries,
+                include_keywords,
+                exclude_keywords,
+                username,
+                password,
+                resume_service,
+                headless,
+                job_limit,
+                run_mode,
+            ),
             daemon=True
         )
         self.job_thread.start()
         
-    def run_job_application(self, search_queries, include_keywords, exclude_keywords, username, password):
+    def run_job_application(
+        self,
+        search_queries,
+        include_keywords,
+        exclude_keywords,
+        username,
+        password,
+        resume_service,
+        headless,
+        job_limit,
+        run_mode,
+    ):
         """Run the job application process in a background thread"""
+        driver = None
         try:
             # Record start time
             start_time = time.time()
-            self.logger.info(f"Starting job applications with queries: {search_queries}")
+            self.logger.info(
+                f"Starting {run_mode.value} run with queries: {search_queries}"
+            )
             
             # Initialize web driver
             self.update_status("Initializing web driver...")
-            headless = self.headless_var.get()
-            driver = get_web_driver()
+            driver = get_web_driver(headless=headless)
             
             # Login to Dice
             self.update_status("Logging in to Dice...")
@@ -653,19 +985,15 @@ After the process completes, you can find:
                 # Print debug info
                 print(f"Query '{query}': Found {len(jobs)} total jobs, added {current_count - jobs_before} unique jobs")
                 
-                # Move mouse to prevent sleeping
-                pyautogui.moveRel(1, 1, duration=0.1)
-                pyautogui.moveRel(-1, -1, duration=0.1)
-                        
             # Make sure the final count is displayed
             final_count = len(all_jobs)
             self.update_status(f"Found {final_count} unique jobs matching criteria")
             self.root.after(0, lambda c=final_count: self.jobs_found_label.config(text=str(c)))
             
             # Save excluded jobs to Excel
+            excluded_file = "excluded_jobs.xlsx"
             if excluded_jobs:
                 try:
-                    excluded_file = "excluded_jobs.xlsx"
                     df_excluded = pd.DataFrame(excluded_jobs)
                     df_excluded.to_excel(excluded_file, index=False)
                     self.logger.info(f"Saved {len(excluded_jobs)} excluded jobs to {excluded_file}")
@@ -683,18 +1011,24 @@ After the process completes, you can find:
                     already_applied = set(df_applied["Job URL"].dropna())
                     self.update_status(f"Found {len(already_applied)} previously applied jobs to skip")
                 except Exception as e:
-                    self.logger.error(f"Error reading applied jobs file: {e}")
+                    raise RuntimeError(
+                        "Could not safely read the prior-application ledger; run aborted."
+                    ) from e
             
             # Filter out already applied jobs
             jobs_to_apply = [job for job in all_jobs.values() if job["Job URL"] not in already_applied]
-            self.update_status(f"Applying to {len(jobs_to_apply)} jobs...")
+            action_label = {
+                RunMode.PREVIEW: "Previewing",
+                RunMode.VERIFY_UPLOAD: "Verifying one upload for",
+                RunMode.SUBMIT: "Applying to",
+            }[run_mode]
+            self.update_status(f"{action_label} {len(jobs_to_apply)} jobs...")
 
             # Update the Total Jobs count to show the jobs that will be processed
             jobs_to_process_count = len(jobs_to_apply)
             self.root.after(0, lambda c=jobs_to_process_count: self.jobs_found_label.config(text=str(c)))
 
             # Apply job limit if set
-            job_limit = self.job_limit_var.get()
             if job_limit > 0 and len(jobs_to_apply) > job_limit:
                 limited_count = job_limit
                 self.update_status(f"Limiting to {job_limit} jobs as per settings")
@@ -726,6 +1060,10 @@ After the process completes, you can find:
             # Start applying to jobs
             applied_count = 0
             failed_count = 0
+            skipped_count = 0
+            ready_count = 0
+            already_applied_count = 0
+            run_results = []
             
             # Variables for dynamic time estimation
             job_start_times = []
@@ -747,11 +1085,21 @@ After the process completes, you can find:
                 
                 # Show job details in status
                 job_title = job.get("Job Title", "Unknown")
-                self.update_status(f"Applying to: {job_title} ({i+1}/{len(jobs_to_apply)})")
+                self.update_status(
+                    f"{run_mode.value.replace('_', ' ').title()}: "
+                    f"{job_title} ({i+1}/{len(jobs_to_apply)})"
+                )
 
-                # Apply to job using your existing function
+                # Prepare and apply through the fail-closed resume-aware flow.
                 try:
-                    result = apply_to_job_url(driver, job["Job URL"])
+                    result = apply_to_job_url(
+                        driver,
+                        job,
+                        resume_service,
+                        run_mode=run_mode,
+                        cancel_requested=lambda: not self.running,
+                    )
+                    run_results.append(dict(job))
                     
                     # Record job completion time and calculate processing time for this job
                     job_end_time = time.time()
@@ -786,7 +1134,7 @@ After the process completes, you can find:
                         # Update the estimated time label
                         self.root.after(0, lambda t=time_remaining: self.estimated_time_label.config(text=t))
                     
-                    if result:
+                    if result.status is ApplicationStatus.APPLIED:
                         applied_count += 1
                         # Update applied count
                         count_to_display = applied_count
@@ -807,8 +1155,59 @@ After the process completes, you can find:
                             df_new = pd.DataFrame([job])
                             df_combined = pd.concat([df_existing, df_new], ignore_index=True)
                             df_combined.to_excel(applied_jobs_file, index=False)
+                            if os.name != "nt":
+                                os.chmod(applied_jobs_file, 0o600)
                         except Exception as e:
-                            self.logger.error(f"Error updating Excel file: {e}")
+                            self.running = False
+                            raise RuntimeError(
+                                "Dice confirmed submission, but the local application ledger "
+                                "could not be updated; stopping the run."
+                            ) from e
+                    elif result.status in {
+                        ApplicationStatus.PREVIEW_READY,
+                        ApplicationStatus.UPLOAD_VERIFIED,
+                    }:
+                        ready_count += 1
+                        count_to_display = ready_count
+                        self.root.after(
+                            0,
+                            lambda c=count_to_display: self.jobs_ready_label.config(
+                                text=str(c)
+                            ),
+                        )
+                        job["Applied"] = False
+                    elif result.status is ApplicationStatus.ALREADY_APPLIED:
+                        already_applied_count += 1
+                        count_to_display = already_applied_count
+                        self.root.after(
+                            0,
+                            lambda c=count_to_display: self.jobs_already_applied_label.config(
+                                text=str(c)
+                            ),
+                        )
+                        job["Applied"] = True
+                    elif result.status is ApplicationStatus.SKIPPED:
+                        skipped_count += 1
+                        count_to_display = skipped_count
+                        self.root.after(
+                            0,
+                            lambda c=count_to_display: self.jobs_skipped_label.config(
+                                text=str(c)
+                            ),
+                        )
+                        try:
+                            job["Applied"] = False
+                            job["Exclusion Reason"] = result.reason
+                            if os.path.exists(excluded_file):
+                                df_existing = pd.read_excel(excluded_file)
+                            else:
+                                df_existing = pd.DataFrame()
+                            df_new = pd.DataFrame([job])
+                            pd.concat([df_existing, df_new], ignore_index=True).to_excel(
+                                excluded_file, index=False
+                            )
+                        except Exception as e:
+                            self.logger.error(f"Error updating excluded jobs file: {e}")
                     else:
                         failed_count += 1
                         # Update failed count
@@ -828,6 +1227,7 @@ After the process completes, you can find:
                                 ])
                             
                             job["Applied"] = False
+                            job["Failure Reason"] = result.reason
                             df_new = pd.DataFrame([job])
                             df_combined = pd.concat([df_existing, df_new], ignore_index=True)
                             df_combined.to_excel(not_applied_file, index=False)
@@ -837,15 +1237,14 @@ After the process completes, you can find:
                 except Exception as e:
                     self.logger.error(f"Error applying to {job_title}: {e}")
                     failed_count += 1
+                    job["Application Status"] = ApplicationStatus.FAILED.value
+                    job["Application Reason"] = f"Unhandled {type(e).__name__}"
+                    run_results.append(dict(job))
                     # Update failed count
                     count_to_display = failed_count
                     self.root.after(0, lambda c=count_to_display: 
                         self.jobs_failed_label.config(text=str(c)))
                 
-                # Move mouse to prevent sleeping
-                pyautogui.moveRel(1, 1, duration=0.1)
-                pyautogui.moveRel(-1, -1, duration=0.1)
-            
             # Compute execution time
             end_time = time.time()
             execution_time = end_time - start_time
@@ -853,25 +1252,49 @@ After the process completes, you can find:
             minutes, seconds = divmod(remainder, 60)
             
             time_str = f"{int(hours)}h {int(minutes)}m {seconds:.2f}s"
-            self.update_status(f"Completed! Applied: {applied_count}, Failed: {failed_count}, Time: {time_str}")
+            self.update_status(
+                f"Completed! Applied: {applied_count}, Ready/verified: {ready_count}, "
+                f"Already applied: {already_applied_count}, Skipped: {skipped_count}, "
+                f"Failed: {failed_count}, Time: {time_str}"
+            )
             
             # Final progress update
             self.root.after(0, lambda: self.progress_bar.config(value=100))
             # Clear estimated time as we're done
             self.root.after(0, lambda: self.estimated_time_label.config(text="Completed"))
             
-            # Save job data to JSON file
-            import json
+            # Save one consolidated, run-scoped report without job-description bodies.
             try:
+                run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+                run_directory = os.path.join(".data", "runs")
+                os.makedirs(run_directory, mode=0o700, exist_ok=True)
+                report_path = os.path.join(
+                    run_directory, f"{run_id}-{run_mode.value}-results.xlsx"
+                )
+                if run_results:
+                    pd.DataFrame(run_results).to_excel(report_path, index=False)
+                    if os.name != "nt":
+                        os.chmod(report_path, 0o600)
                 job_data = {
+                    "Run ID": run_id,
+                    "Run Mode": run_mode.value,
                     "Total Jobs Found": len(all_jobs),
                     "Jobs Applied": applied_count,
+                    "Jobs Ready or Upload Verified": ready_count,
+                    "Jobs Already Applied": already_applied_count,
+                    "Jobs Skipped": skipped_count,
                     "Jobs Failed": failed_count,
                     "Execution Time": time_str,
                     "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
-                with open("job_application_summary.json", "w") as f:
+                summary_path = os.path.join(
+                    run_directory, f"{run_id}-{run_mode.value}-summary.json"
+                )
+                with open(summary_path, "w", encoding="utf-8") as f:
                     json.dump(job_data, f, indent=4)
+                if os.name != "nt":
+                    os.chmod(summary_path, 0o600)
+                self.logger.info(f"Run report saved under {run_directory}")
             except Exception as e:
                 self.logger.error(f"Error saving job data: {e}")
                 
@@ -880,6 +1303,9 @@ After the process completes, you can find:
                 "Process Complete", 
                 f"Application process completed!\n\n"
                 f"Applied to {applied_count} jobs\n"
+                f"Ready or upload verified: {ready_count}\n"
+                f"Already applied: {already_applied_count}\n"
+                f"Skipped {skipped_count} jobs\n"
                 f"Failed for {failed_count} jobs\n\n"
                 f"Total execution time: {time_str}"
             ))
@@ -890,11 +1316,19 @@ After the process completes, you can find:
         except Exception as e:
             self.logger.error(f"Error in job application process: {e}")
             self.update_status(f"Error: {str(e)}")
-            self.root.after(0, lambda: messagebox.showerror(
-                "Error", 
-                f"An error occurred: {str(e)}"
-            ))
+            error_message = str(e)
+            self.root.after(
+                0,
+                lambda message=error_message: messagebox.showerror(
+                    "Error", f"An error occurred: {message}"
+                ),
+            )
         finally:
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
             # Reset UI
             self.reset_ui()
 
@@ -914,7 +1348,7 @@ After the process completes, you can find:
         """Reset UI after job completion or stop"""
         self.running = False
         self.start_button.config(state="normal")
-        self.stop_button.config(state="normal", text="Stop")
+        self.stop_button.config(state="disabled", text="Stop")
         
     def update_status(self, message):
         """Update status message and log it"""

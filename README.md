@@ -1,136 +1,169 @@
-# Dice Auto Apply Bot
+# Dice Resume-Aware Apply Bot
 
-Dice Auto Apply Bot is a Python-based application that automates your job application process on Dice.com. It leverages Selenium for web automation, BeautifulSoup for HTML parsing, and Tkinter for a user-friendly GUI.
+This repository contains an early-stage Python desktop application that searches Dice,
+filters jobs, chooses the most relevant AWS/Azure/GCP resume, and supports Dice Easy Apply.
+It is a maintained prototype, not a production service or a supported Dice integration.
 
-## Features
-- **Automated Job Search & Application:** Automatically search for and apply to job listings using specified queries and filters.
-- **Graphical User Interface:** Tkinter-based UI for easy control and monitoring of the application process.
-- **Cross-Platform Support:** Works on both Windows and macOS/Linux systems.
-- **Customizable Configuration:** Set job search queries, include/exclude keywords, and configure job application limits.
-- **Logging and Reporting:** Detailed logs and Excel outputs for applied, not applied, and excluded jobs.
+The default run mode is **preview**. It reads job details and reports fit decisions without
+clicking Apply.
 
-## Demo Video
+Live automation is disabled unless `DICE_AUTOMATION_AUTHORIZED=true`. Set that flag only
+after obtaining Dice's prior written authorization. Dice's current terms restrict automated
+navigation and retrieval, inaccurate resume content, and keyword stuffing. See the
+[Dice Terms and Conditions](https://www.dice.com/about/terms-and-conditions/).
 
-Watch a complete demonstration of how to set up and use the Dice Auto Apply Bot:
+## Resume modes
 
-[![Watch the Demo Video](https://img.shields.io/badge/Watch-Demo_Video-red?style=for-the-badge&logo=google-drive&logoColor=white)](https://drive.google.com/file/d/1c0Y69PZ5UlFb3dZg0_-_wn7UibRQQwlW/view?usp=sharing)
+- **Static:** score all three resumes against the full job title and description, skip jobs
+  below the configured threshold, and upload the best source file unchanged. Static mode
+  accepts DOCX or text-based PDF resumes.
+- **Tailored:** select the best DOCX, ask OpenAI for an ID-only ordering plan, validate that
+  every returned ID is an exact permutation of candidate-authored skill items, and create a
+  job-specific DOCX. The model cannot add, delete, rename, or rewrite skills or claims. The
+  generated file must render to the same page count as its source or it is deleted and skipped.
 
-The video shows step-by-step instructions for installation, configuration, and running the application on both Windows and Mac.
+Both modes require exactly three user-approved files labelled AWS, Azure, and GCP. No personal
+resume files are included in the repository.
+
+## Current safety behavior
+
+The application skips instead of submitting when any of these checks fail:
+
+- the job description cannot be read;
+- the best resume score is below the configured threshold;
+- tailored output is refused, malformed, unchanged, or structurally unsafe;
+- the posting leaves Dice instead of entering Dice Easy Apply;
+- the intended filename cannot be verified in a file input; or
+- Dice does not visibly confirm submission.
+
+Each run also requires an explicit confirmation in the GUI. Resume contents, job descriptions,
+and API keys are not written to application logs.
+
+Three side-effect levels are available:
+
+- **Preview:** inspect, score, and classify Easy Apply jobs; never click Apply.
+- **Verify upload:** one-job maximum; select and verify the exact resume file, then stop before
+  Next or Submit. Dice may retain a draft.
+- **Submit:** upload and submit only after all fit, upload, form, and confirmation checks pass.
 
 ## Prerequisites
-- Python 3.x installed.
-- A web browser (preferably Brave Browser, but Chrome, Firefox, Edge or Safari will also work).
-- Git (optional) if you wish to clone the repository.
 
-## Installation
+- Python 3.12
+- macOS, Windows, or Linux with Tkinter
+- Brave or Google Chrome; browser launching currently uses ChromeDriver
+- LibreOffice/`soffice` for tailored-mode rendered page-count verification
+- A Dice account and prior written authorization from Dice for automated access
+- An OpenAI API key only for tailored mode
 
-### Clone the Repository
-Copy and run these commands:
+## Setup
 
 ```bash
 git clone https://github.com/yuva-raja-reddy/auto-apply-dice-jobs.git
 cd auto-apply-dice-jobs
+python3.12 -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+python -m pip install -r requirements.txt
+cp .env.example .env
 ```
 
-### Create and Activate a Virtual Environment
+Edit `.env` locally. Never commit it:
 
-#### For Windows
-```bash
-python -m venv venv
-venv\Scripts\activate
+```dotenv
+DICE_USERNAME=
+DICE_PASSWORD=
+DICE_AUTOMATION_AUTHORIZED=false
+WEB_BROWSER_PATH=
+LIBREOFFICE_PATH=
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-5.5-2026-04-23
 ```
 
-#### For macOS / Linux
-```bash
-python3 -m venv venv
-source venv/bin/activate
-```
+`OPENAI_API_KEY` is unnecessary in static mode. The default is a pinned GPT-5.5 snapshot because
+GPT-5.6 was still unavailable to this project's API account during initialization. Change
+`OPENAI_MODEL` only after running the evaluation set.
 
-### Install Dependencies
-After activating your virtual environment, install the required packages:
+## Run locally
 
 ```bash
-pip install -r requirements.txt
-```
-
-If your Python installation doesn't include Tkinter, install it using:
-
-```bash
-# For macOS
-brew install python-tk
-
-# For Ubuntu/Debian
-sudo apt-get install python3-tk
-```
-
-## Running the Application
-
-### For Windows
-```bash
-# Using the run script
 python run.py
-
-# Or directly
-python app_tkinter.py
 ```
 
-### For macOS / Linux
+In **Settings**:
+
+1. Enter and test Dice credentials.
+2. Leave the run mode on `preview` for the first run.
+3. Choose `static` or `tailored`.
+4. Select and validate one AWS, Azure, and GCP resume.
+5. Choose the minimum match score, winner margin, and a small job limit.
+6. Save settings. Personal paths are written atomically to ignored
+   `config/settings.local.json` with local-only permissions.
+7. Start the bot and review the mode-specific confirmation.
+
+Generated tailored files are kept under ignored `.data/tailored_resumes/`. Consolidated,
+run-scoped Excel and JSON reports are written under ignored `.data/runs/`.
+
+## Development and validation
+
+Install development tools in the same virtual environment:
+
 ```bash
-# Using the run script (recommended)
-python3 run.py
-
-# Or directly
-python3 app_tkinter.py
-
-# If you encounter permission issues with chromedriver
-chmod +x run.py
-./run.py
+python -m pip install -r requirements-dev.txt
+python -m scripts.validate
 ```
 
-The run.py script automatically handles chromedriver permissions, which is particularly helpful for macOS users.
+The full command runs dependency checks, formatting checks, high-signal linting over the legacy
+application, full linting and strict type checks for the new resume domain, offline tests,
+deterministic matching evals, and Python bytecode compilation.
 
-## Browser Configuration
+Individual commands:
 
-The application will automatically detect your installed browsers in this preference order:
-1. Brave Browser (recommended)
-2. Google Chrome
-3. Safari (macOS only)
-4. Microsoft Edge
-5. Firefox
+```bash
+python -m ruff format core/resumes tests scripts
+python -m ruff format --check core/resumes tests scripts
+python -m ruff check --select E9,F401,F63,F7,F82 .
+python -m ruff check core/resumes tests scripts
+python -m mypy
+python -m pytest
+python -m scripts.run_evals
+python -m compileall -q app_tkinter.py core run.py
+```
 
-If Brave Browser is installed, it will be used by default. If not, the application will fall back to the next available browser in the preference list.
+There is no packaging/build command yet: this prototype is run from source and has no defined
+deployment artifact.
 
-## Using the Application
+## Repository map
 
-Once started, the GUI allows you to:
-- Test your Dice login credentials.
-- Configure job search queries and keywords.
-- Start the automated job application process.
-- Monitor progress and view real-time logs.
-- Access Excel files with summaries of applied, not applied, and excluded jobs.
+- `app_tkinter.py` - GUI, local settings, run confirmation, and orchestration
+- `core/main_script.py` - Dice/Chrome adapter and fail-closed Easy Apply flow
+- `core/resumes/` - matching, document validation, OpenAI boundary, and resume service
+- `config/settings.json` - safe tracked defaults
+- `config/settings.local.json` - ignored personal settings created by the GUI
+- `evals/` - credential-free matching cases
+- `tests/` - offline unit and workflow tests; no live Dice/OpenAI calls
+- `scripts/validate.py` - canonical full validation command
+- `scripts/audit_resumes.py` - privacy-safe offline compatibility and match preview
+- `scripts/live_resume_smoke.py` - opt-in synthetic OpenAI plus rendered-layout smoke test
 
-### Application Settings via the GUI
-1. Navigate to the **Settings** tab.
-2. Enter your Dice login credentials and test the connection.
-3. Configure your job search queries, include/exclude keywords, and set the maximum number of applications.
-4. Click **Save Settings** to persist your configuration.
-5. Return to the **Run Bot** tab to start applying.
+Architecture, development, and risk details live in:
 
-## Troubleshooting
+- [Product scope](docs/product.md)
+- [Architecture](docs/architecture.md)
+- [Development guide](docs/development.md)
+- [Security and privacy](docs/security.md)
+- [Sample resume validation](docs/sample-validation.md)
+- [Curation safety decision](docs/decisions/0001-truth-preserving-curation.md)
 
-- **Slow Login Issues:**  
-  The application has been updated to handle slower login processes. If you still experience issues, try increasing timeouts in the settings.
+## Known limitations
 
-- **WebDriver Issues:**  
-  The application uses `webdriver_manager` to handle drivers automatically. If you encounter issues, try running `run.py` which fixes common permission issues.
-
-- **Browser Detection Problems:**  
-  If your browser isn't being detected correctly, you can manually specify the browser path in the .env file.
-
-## Contributing
-Feel free to fork this repository and submit pull requests for improvements, additional features, or bug fixes.
-
-## Support
-If you find this project useful, please consider supporting its development:
-
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/yuvarajareddy)
+- Dice selectors and wizard behavior can change. No live Dice submission was executed during
+  repository initialization or sample validation.
+- Tailored mode safely reorders existing skill items; it intentionally does not rewrite prose,
+  employment history, dates, metrics, education, or certifications.
+- Tailored mode requires parseable delimiter-based skill lists in DOCX files. Complex text boxes,
+  content controls, tracked changes, or scanned documents are not supported.
+- The matcher uses a version-controlled technology taxonomy and a lexical signal. The eval set is
+  a regression baseline, not proof of universal ranking quality.
+- PDF is selection/upload-only; safe structure-preserving PDF editing is out of scope.
+- Selenium Manager/browser resolution has not been live-tested across the supported platforms.
+- The supplied GCP sample is safe for static selection but currently rejects every tailored
+  reorder because it would grow from two rendered pages to three.

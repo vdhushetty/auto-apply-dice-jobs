@@ -1,34 +1,23 @@
 import os
-import json
-import pandas as pd
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.keys import Keys
-from selenium.common.exceptions import ElementClickInterceptedException
-from dotenv import load_dotenv
-import time
+import platform
 import re
-import pyautogui
-import datetime
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import quote
-# Try both absolute and relative imports for compatibility
-try:
-    from dice_auto_apply.core.browser_detector import get_browser_path
-    from dice_auto_apply.core.dice_login import login_to_dice
-except ImportError:
-    try:
-        from ..core.browser_detector import get_browser_path
-        from ..core.dice_login import login_to_dice
-    except ImportError:
-        from core.browser_detector import get_browser_path
-        from core.dice_login import login_to_dice
+import time
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Any, Callable, Mapping
+from urllib.parse import quote, urlparse
+
+import pandas as pd
+from dotenv import load_dotenv
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+from core.authorization import require_dice_automation_authorized
+from core.browser_detector import get_browser_path
+from core.resumes import JobPosting, ResumeService
 
 
 # Load environment variables
@@ -46,27 +35,6 @@ def get_web_driver(headless=False, retry_with_alternative=True):
     Returns:
         WebDriver: Initialized WebDriver instance
     """
-    # Fix ChromeDriver permissions first
-    try:
-        # Import fix_chromedriver
-        import sys
-        import os
-        
-        # Add the parent directory to the path to find fix_chromedriver
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        parent_dir = os.path.dirname(script_dir)
-        if parent_dir not in sys.path:
-            sys.path.insert(0, parent_dir)
-            
-        # Run fix_chromedriver
-        from fix_chromedriver import fix_chromedriver_permissions
-        fix_chromedriver_permissions()
-    except Exception as e:
-        print(f"Warning: Could not fix ChromeDriver permissions: {e}")
-
-
-    import platform  # Add this import for system detection
-    
     # Get browser path from .env or detect it
     web_browser_path = get_browser_path()
     
@@ -86,12 +54,8 @@ def get_web_driver(headless=False, retry_with_alternative=True):
             
         options.add_argument("--disable-gpu")
         options.add_argument("--window-size=1920,1080")
-        options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument("--disable-popup-blocking")
-        options.add_argument("--disable-web-security")
         options.add_argument("--disable-features=EnableEphemeralFlashPermission")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--remote-debugging-port=9222")
         options.add_argument("--disable-infobars")
         options.add_argument("--disable-notifications")
         
@@ -99,11 +63,10 @@ def get_web_driver(headless=False, retry_with_alternative=True):
         options.add_argument("--disable-application-cache")
         options.add_argument("--incognito")
 
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        driver = webdriver.Chrome(options=options)
         
-        # Test navigation to a simple page to verify browser is working
-        driver.get("https://www.google.com")
+        # Test local navigation without making an unrelated external request.
+        driver.get("data:text/html,<body>ready</body>")
         driver.find_element(By.TAG_NAME, "body")  # Should work if page loaded
         
         print(f"Successfully initialized browser: {os.path.basename(web_browser_path)}")
@@ -154,14 +117,12 @@ def get_web_driver(headless=False, retry_with_alternative=True):
                     
                 options.add_argument("--disable-gpu")
                 options.add_argument("--window-size=1920,1080")
-                options.add_argument("--disable-blink-features=AutomationControlled")
                 options.add_argument("--incognito")  # Use incognito to avoid cache issues
                 
-                driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-                driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+                driver = webdriver.Chrome(options=options)
                 
-                # Test navigation
-                driver.get("https://www.google.com")
+                # Test local navigation without making an unrelated external request.
+                driver.get("data:text/html,<body>ready</body>")
                 driver.find_element(By.TAG_NAME, "body")
                 
                 print(f"Successfully initialized alternative browser: {os.path.basename(alt_path)}")
@@ -184,302 +145,556 @@ def get_web_driver(headless=False, retry_with_alternative=True):
 
 
 
-def apply_to_job_url(driver, job_url):
-    """
-    Applies to a job without opening a new tab, preventing focus stealing.
-    Instead navigates to job URL in the same tab and returns to original URL when done.
-    """
-    # Store current URL to return to later
-    original_url = driver.current_url
-    
-    # Navigate to job URL in the same tab
-    driver.get(job_url)
-    
-    # Dice pages can be slow/heavy; give a bit more time for the apply control to become interactable
-    wait = WebDriverWait(driver, 20)
-    applied = False
-    
-    # move pointer to prevent sleeping
-    pyautogui.moveRel(1, 1, duration=0.1)
-    pyautogui.moveRel(-1, -1, duration=0.1)
+class ApplicationStatus(StrEnum):
+    APPLIED = "applied"
+    ALREADY_APPLIED = "already_applied"
+    PREVIEW_READY = "preview_ready"
+    UPLOAD_VERIFIED = "upload_verified"
+    SKIPPED = "skipped"
+    FAILED = "failed"
 
+
+class RunMode(StrEnum):
+    """Allowed browser side-effect levels for one job."""
+
+    PREVIEW = "preview"
+    VERIFY_UPLOAD = "verify_upload"
+    SUBMIT = "submit"
+
+
+@dataclass(frozen=True)
+class ApplicationResult:
+    status: ApplicationStatus
+    reason: str
+    resume_profile: str = ""
+    match_score: float | None = None
+    resume_filename: str = ""
+
+
+def _visible(elements):
+    return next((element for element in elements if element.is_displayed()), None)
+
+
+def _visible_enabled(elements):
+    return next(
+        (element for element in elements if element.is_displayed() and element.is_enabled()),
+        None,
+    )
+
+
+def _extract_job_description(driver) -> str:
+    selectors = (
+        '[data-testid="job-description"]',
+        '[data-testid="jobDescription"]',
+        "#jobDescription",
+        ".job-description",
+    )
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        for selector in selectors:
+            for element in driver.find_elements(By.CSS_SELECTOR, selector):
+                text = "\n".join(line.strip() for line in element.text.splitlines() if line.strip())
+                if len(text) >= 100:
+                    return text
+        time.sleep(0.4)
+    return ""
+
+
+def _find_apply_control(driver):
+    controls = driver.find_elements(
+        By.CSS_SELECTOR,
+        'button[data-testid="apply-button"], a[data-testid="apply-button"]',
+    )
+    visible = [control for control in controls if control.is_displayed()]
+    already_applied = next(
+        (
+            control
+            for control in visible
+            if "applied" in (control.text or "").strip().lower()
+            or "application submitted" in (control.text or "").strip().lower()
+        ),
+        None,
+    )
+    if already_applied is not None:
+        return already_applied
+    easy_apply = next(
+        (
+            control
+            for control in visible
+            if "easy apply" in (control.text or "").strip().lower()
+            or (
+                "/job-applications/" in (control.get_attribute("href") or "").lower()
+                and "/wizard" in (control.get_attribute("href") or "").lower()
+            )
+        ),
+        None,
+    )
+    return easy_apply or _visible(visible)
+
+
+def _browser_filename(value: str) -> str:
+    return value.replace("\\", "/").rsplit("/", 1)[-1].strip().lower()
+
+
+def _upload_resume_if_present(driver, resume_path: str) -> tuple[bool, bool]:
+    inputs = driver.find_elements(By.CSS_SELECTOR, 'input[type="file"]')
+    if not inputs:
+        return False, False
+    filename = os.path.basename(resume_path).lower()
+    for file_input in inputs:
+        try:
+            file_input.send_keys(resume_path)
+
+            def intended_file_selected(current_driver):
+                selected_name = current_driver.execute_script(
+                    "const files = arguments[0].files; "
+                    "return files && files.length ? files[0].name : '';",
+                    file_input,
+                )
+                if _browser_filename(str(selected_name or "")) == filename:
+                    return True
+                value = file_input.get_attribute("value") or ""
+                return _browser_filename(value) == filename
+
+            WebDriverWait(driver, 12, poll_frequency=0.25).until(intended_file_selected)
+            return True, True
+        except Exception:
+            continue
+    return True, False
+
+
+def _confirmation_present(driver):
+    selectors = (
+        '[data-testid="job-application-success-card"]',
+        '[data-testid="application-success"]',
+        "header.post-apply-banner h1",
+    )
+    for selector in selectors:
+        for element in driver.find_elements(By.CSS_SELECTOR, selector):
+            if not element.is_displayed():
+                continue
+            if selector.startswith("[data-testid="):
+                return True
+            if "application submitted" in (element.text or "").strip().lower():
+                return True
+    return False
+
+
+def _has_visible_screening_controls(driver) -> bool:
+    selectors = (
+        'input:not([type="hidden"]):not([type="file"]):not([type="submit"]):not([type="button"])',
+        "select",
+        "textarea",
+        '[role="checkbox"]',
+        '[role="radio"]',
+        '[contenteditable="true"]',
+    )
+    return any(
+        element.is_displayed()
+        for selector in selectors
+        for element in driver.find_elements(By.CSS_SELECTOR, selector)
+    )
+
+
+def _is_dice_url(url: str, *, job_detail: bool = False) -> bool:
     try:
-        # Dice UI has evolved multiple times. Current (Feb 2026) uses:
-        # - button[data-testid="apply-button"] with text "Apply Now" or "Easy Apply"
-        # - Located inside a job-detail-header-card or the older #applyButton container
-        #
-        # We poll until the button appears and has actionable text.
-        max_attempts = 40  # ~20 seconds at 0.5s intervals
-        status = None
-        apply_kind = None
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme != "https" or parsed.hostname != "www.dice.com":
+        return False
+    return not job_detail or parsed.path.startswith("/job-detail/")
 
-        for _ in range(max_attempts):
-            apply_check = driver.execute_script("""
-                // 2026 Dice UI: button with data-testid="apply-button"
-                const applyBtn = document.querySelector('button[data-testid="apply-button"]');
-                if (applyBtn) {
-                    const text = (applyBtn.textContent || '').trim();
-                    const disabled = applyBtn.disabled || applyBtn.getAttribute('aria-disabled') === 'true';
-                    return { found: true, kind: 'button', text, disabled };
-                }
 
-                // 2026 Dice UI variant: anchor <a> with data-testid="apply-button" (can be anywhere in page)
-                const applyAnchor = document.querySelector('a[data-testid="apply-button"]');
-                if (applyAnchor) {
-                    const text = (applyAnchor.textContent || '').trim();
-                    const href = applyAnchor.getAttribute('href') || '';
-                    const ariaDisabled = applyAnchor.getAttribute('aria-disabled');
-                    return { found: true, kind: 'anchor', text, href, ariaDisabled };
-                }
+def _cancellation_requested(callback: Callable[[], bool] | None) -> bool:
+    if callback is None:
+        return False
+    try:
+        return bool(callback())
+    except Exception:
+        return True
 
-                // Legacy: shadow DOM web component
-                const applyButtonWc = document.querySelector('apply-button-wc');
-                if (applyButtonWc && applyButtonWc.shadowRoot) {
-                    const shadowText = applyButtonWc.shadowRoot.textContent || '';
-                    if (shadowText.includes('Application Submitted')) {
-                        return { found: true, kind: 'shadow', status: 'already_applied' };
-                    }
-                    if ((shadowText || '').toLowerCase().includes('easy apply') ||
-                        (shadowText || '').toLowerCase().includes('apply now') ||
-                        (shadowText || '').toLowerCase().includes('apply')) {
-                        return { found: true, kind: 'shadow', status: 'can_apply' };
-                    }
-                    return { found: true, kind: 'shadow', status: 'unknown' };
-                }
 
-                return { found: false };
-            """)
+def _decision_metadata(outcome) -> tuple[str, float | None]:
+    decision = getattr(outcome, "decision", None)
+    if decision is None and hasattr(outcome, "selected_profile"):
+        decision = outcome
+    if decision is None:
+        return "", None
+    selected_profile = getattr(decision, "selected_profile", None)
+    profile = getattr(selected_profile, "value", str(selected_profile or ""))
+    return profile, getattr(decision, "score", None)
 
-            if apply_check and apply_check.get("found"):
-                apply_kind = apply_check.get("kind")
 
-                if apply_kind == "button":
-                    text = (apply_check.get("text") or "").strip()
-                    text_l = text.lower()
-                    disabled = apply_check.get("disabled", False)
+def _record_decision_metadata(job: Mapping[str, Any], outcome) -> None:
+    if not isinstance(job, dict):
+        return
+    decision = getattr(outcome, "decision", None)
+    if decision is None and hasattr(outcome, "variant_scores"):
+        decision = outcome
+    if decision is None:
+        return
+    variant_scores = getattr(decision, "variant_scores", {})
+    if isinstance(variant_scores, Mapping):
+        for profile, score in variant_scores.items():
+            job[f"{str(profile).upper()} Resume Score"] = score
+    job["Resume Score Margin"] = getattr(decision, "score_margin", None)
+    job["Minimum Winner Margin"] = getattr(decision, "minimum_winner_margin", None)
 
-                    if "applied" in text_l or "application submitted" in text_l:
-                        status = "already_applied"
-                        break
 
-                    if ("apply now" in text_l or "easy apply" in text_l or "apply" in text_l) and not disabled:
-                        status = "can_apply"
-                        break
+def _record_resume_metadata(job: Mapping[str, Any], result: ApplicationResult) -> None:
+    if not isinstance(job, dict):
+        return
+    job["Application Status"] = result.status.value
+    job["Application Reason"] = result.reason
+    if result.resume_profile:
+        job["Resume Profile"] = result.resume_profile
+    if result.match_score is not None:
+        job["Resume Match Score"] = result.match_score
+    if result.resume_filename:
+        job["Resume Filename"] = result.resume_filename
 
-                    # Button present but not yet hydrated or still disabled; keep waiting.
-                    status = None
 
-                elif apply_kind == "anchor":
-                    text = (apply_check.get("text") or "").strip()
-                    href = (apply_check.get("href") or "").strip()
-                    text_l = text.lower()
+def apply_to_job_url(
+    driver,
+    job: Mapping[str, Any],
+    resume_service: ResumeService,
+    *,
+    run_mode: RunMode | str = RunMode.SUBMIT,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> ApplicationResult:
+    """Prepare, upload, and submit one Dice Easy Apply job; fail closed on uncertainty."""
 
-                    if "applied" in text_l or "application submitted" in text_l:
-                        status = "already_applied"
-                        break
+    require_dice_automation_authorized()
+    mode = RunMode(run_mode)
+    job_url = str(job.get("Job URL", ""))
+    job_title = str(job.get("Job Title", "")).strip()
+    job_id = str(job.get("Job ID", "")).strip()
+    original_url = driver.current_url
+    result = ApplicationResult(ApplicationStatus.FAILED, "Application did not complete.")
+    navigated = False
+    try:
+        if not _is_dice_url(job_url, job_detail=True):
+            result = ApplicationResult(
+                ApplicationStatus.SKIPPED,
+                "Only HTTPS Dice job-detail URLs are accepted.",
+            )
+            return result
+        if _cancellation_requested(cancel_requested):
+            result = ApplicationResult(
+                ApplicationStatus.SKIPPED,
+                "Run cancelled before navigation.",
+            )
+            return result
+        driver.get(job_url)
+        navigated = True
+        description = _extract_job_description(driver)
+        if not description:
+            result = ApplicationResult(
+                ApplicationStatus.SKIPPED,
+                "Dice job description could not be read; skipped to avoid a random application.",
+            )
+            return result
 
-                    # Match "Apply", "Easy Apply", "Apply Now", or href pointing to wizard
-                    if text_l in ("apply", "easy apply", "apply now") or "apply" in text_l or ("/job-applications/" in href and "/wizard" in href):
-                        status = "can_apply"
-                        break
+        try:
+            posting = JobPosting(
+                title=job_title,
+                description=description,
+                url=job_url,
+                job_id=job_id,
+            )
+        except ValueError as exc:
+            result = ApplicationResult(ApplicationStatus.SKIPPED, str(exc))
+            return result
 
-                    status = None
+        evaluation = None
+        preparation = None
+        evaluator = getattr(resume_service, "evaluate", None)
+        if mode is RunMode.PREVIEW:
+            if not callable(evaluator):
+                result = ApplicationResult(
+                    ApplicationStatus.FAILED,
+                    "Preview requires a side-effect-free resume evaluator.",
+                )
+                return result
+            evaluation = evaluator(posting)
+        elif callable(evaluator):
+            evaluation = evaluator(posting)
+        else:
+            preparation = resume_service.prepare(posting)
 
-                else:
-                    shadow_status = apply_check.get("status", "unknown")
-                    if shadow_status in {"already_applied", "can_apply"}:
-                        status = shadow_status
-                        break
-                    status = None
+        gate_outcome = evaluation if evaluation is not None else preparation
+        profile, score = _decision_metadata(gate_outcome)
+        _record_decision_metadata(job, gate_outcome)
+        if gate_outcome is None or not getattr(gate_outcome, "eligible", False):
+            result = ApplicationResult(
+                ApplicationStatus.SKIPPED,
+                getattr(gate_outcome, "reason", "Resume evaluation did not approve this job."),
+                resume_profile=profile,
+                match_score=score,
+            )
+            return result
 
+        apply_control = WebDriverWait(driver, 20).until(
+            lambda current: _find_apply_control(current)
+        )
+        control_text = (apply_control.text or "").strip().lower()
+        control_href = (apply_control.get_attribute("href") or "").strip().lower()
+        if "applied" in control_text or "application submitted" in control_text:
+            result = ApplicationResult(
+                ApplicationStatus.ALREADY_APPLIED,
+                "Dice reports that this job was already applied to.",
+                resume_profile=profile,
+                match_score=score,
+            )
+            return result
+        is_easy_apply = "easy apply" in control_text or (
+            "/job-applications/" in control_href and "/wizard" in control_href
+        )
+        if not is_easy_apply:
+            result = ApplicationResult(
+                ApplicationStatus.SKIPPED,
+                "Only the Dice Easy Apply wizard is supported; external Apply links are skipped.",
+                resume_profile=profile,
+                match_score=score,
+            )
+            return result
+        if not apply_control.is_enabled():
+            result = ApplicationResult(
+                ApplicationStatus.SKIPPED,
+                "Dice Easy Apply is visible but not enabled.",
+                resume_profile=profile,
+                match_score=score,
+            )
+            return result
+        if mode is RunMode.PREVIEW:
+            result = ApplicationResult(
+                ApplicationStatus.PREVIEW_READY,
+                "Preview confirmed an eligible Dice Easy Apply job; Apply was not clicked.",
+                resume_profile=profile,
+                match_score=score,
+            )
+            return result
+
+        if preparation is None:
+            prepare_selected = getattr(resume_service, "prepare_selected", None)
+            if callable(prepare_selected) and evaluation is not None:
+                decision = getattr(evaluation, "decision", evaluation)
+                preparation = prepare_selected(posting, decision)
+            else:
+                preparation = resume_service.prepare(posting)
+        profile, score = _decision_metadata(preparation)
+        if not getattr(preparation, "eligible", False) or getattr(
+            preparation, "prepared", None
+        ) is None:
+            result = ApplicationResult(
+                ApplicationStatus.SKIPPED,
+                getattr(preparation, "reason", "Resume preparation did not approve this job."),
+                resume_profile=profile,
+                match_score=score,
+            )
+            return result
+        prepared_path = preparation.prepared.path.resolve()
+        if isinstance(job, dict):
+            job["Tailored Resume"] = bool(preparation.prepared.tailored)
+
+        if _cancellation_requested(cancel_requested):
+            result = ApplicationResult(
+                ApplicationStatus.SKIPPED,
+                "Run cancelled before opening Dice Easy Apply.",
+                resume_profile=profile,
+                match_score=score,
+            )
+            return result
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});",
+            apply_control,
+        )
+        try:
+            apply_control.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", apply_control)
+
+        next_locator = (
+            By.XPATH,
+            "//button[not(@disabled) and (@type='submit' or @type='button') and "
+            "(normalize-space(.)='Next' or .//span[normalize-space()='Next'])]",
+        )
+        submit_locator = (
+            By.XPATH,
+            "//button[not(@disabled) and (@type='submit' or @type='button') and "
+            "(normalize-space(.)='Submit' or .//span[normalize-space()='Submit'])]",
+        )
+        resume_uploaded = False
+        for _ in range(12):
+            if not _is_dice_url(driver.current_url):
+                result = ApplicationResult(
+                    ApplicationStatus.SKIPPED,
+                    "Apply navigation left Dice; external applications are not automated.",
+                    resume_profile=profile,
+                    match_score=score,
+                )
+                return result
+
+            if not resume_uploaded:
+                if _cancellation_requested(cancel_requested):
+                    result = ApplicationResult(
+                        ApplicationStatus.SKIPPED,
+                        "Run cancelled before selecting the resume file.",
+                        resume_profile=profile,
+                        match_score=score,
+                    )
+                    return result
+                found_input, upload_succeeded = _upload_resume_if_present(
+                    driver, str(prepared_path)
+                )
+                if found_input and not upload_succeeded:
+                    result = ApplicationResult(
+                        ApplicationStatus.FAILED,
+                        "The intended resume could not be uploaded and verified.",
+                        resume_profile=profile,
+                        match_score=score,
+                    )
+                    return result
+                resume_uploaded = upload_succeeded
+                if resume_uploaded and mode is RunMode.VERIFY_UPLOAD:
+                    result = ApplicationResult(
+                        ApplicationStatus.UPLOAD_VERIFIED,
+                        "The intended resume filename was verified; Next and Submit "
+                        "were not clicked.",
+                        resume_profile=profile,
+                        match_score=score,
+                        resume_filename=prepared_path.name,
+                    )
+                    return result
+
+            if mode is RunMode.VERIFY_UPLOAD:
+                submit_visible = _visible_enabled(driver.find_elements(*submit_locator))
+                next_visible = _visible_enabled(driver.find_elements(*next_locator))
+                if submit_visible is not None or next_visible is not None:
+                    result = ApplicationResult(
+                        ApplicationStatus.SKIPPED,
+                        "Dice did not expose a resume input on the initial wizard step; "
+                        "verification mode never clicks Next or Submit.",
+                        resume_profile=profile,
+                        match_score=score,
+                    )
+                    return result
+                time.sleep(0.5)
+                continue
+
+            submit_button = _visible_enabled(driver.find_elements(*submit_locator))
+            if submit_button is not None:
+                if not resume_uploaded:
+                    result = ApplicationResult(
+                        ApplicationStatus.SKIPPED,
+                        "Dice did not expose a verifiable resume upload before Submit.",
+                        resume_profile=profile,
+                        match_score=score,
+                    )
+                    return result
+                if _has_visible_screening_controls(driver):
+                    result = ApplicationResult(
+                        ApplicationStatus.SKIPPED,
+                        "Visible screening questions or consent controls require manual review.",
+                        resume_profile=profile,
+                        match_score=score,
+                        resume_filename=prepared_path.name,
+                    )
+                    return result
+                if _cancellation_requested(cancel_requested):
+                    result = ApplicationResult(
+                        ApplicationStatus.SKIPPED,
+                        "Run cancelled before Submit.",
+                        resume_profile=profile,
+                        match_score=score,
+                        resume_filename=prepared_path.name,
+                    )
+                    return result
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center'});", submit_button
+                )
+                try:
+                    submit_button.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", submit_button)
+                try:
+                    WebDriverWait(driver, 30, poll_frequency=0.4).until(
+                        _confirmation_present
+                    )
+                except Exception:
+                    result = ApplicationResult(
+                        ApplicationStatus.FAILED,
+                        "Submit was clicked, but Dice did not confirm the application.",
+                        resume_profile=profile,
+                        match_score=score,
+                        resume_filename=prepared_path.name,
+                    )
+                    return result
+                result = ApplicationResult(
+                    ApplicationStatus.APPLIED,
+                    "Dice confirmed the application submission.",
+                    resume_profile=profile,
+                    match_score=score,
+                    resume_filename=prepared_path.name,
+                )
+                return result
+
+            next_button = _visible_enabled(driver.find_elements(*next_locator))
+            if next_button is not None:
+                if _has_visible_screening_controls(driver):
+                    result = ApplicationResult(
+                        ApplicationStatus.SKIPPED,
+                        "Visible screening questions or consent controls require manual review.",
+                        resume_profile=profile,
+                        match_score=score,
+                        resume_filename=prepared_path.name if resume_uploaded else "",
+                    )
+                    return result
+                if _cancellation_requested(cancel_requested):
+                    result = ApplicationResult(
+                        ApplicationStatus.SKIPPED,
+                        "Run cancelled before Next.",
+                        resume_profile=profile,
+                        match_score=score,
+                        resume_filename=prepared_path.name if resume_uploaded else "",
+                    )
+                    return result
+                try:
+                    next_button.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", next_button)
+                time.sleep(0.6)
+                continue
             time.sleep(0.5)
 
-        if not status:
-            driver.get(original_url)
-            return False
-
-        if status == "already_applied":
-            print(f"Skipping this Job as it is already applied: {job_url}")
-            applied = True
-
-        elif status == "can_apply":
-            click_success = False
-
-            if apply_kind == "button":
-                # New Dice UI: button[data-testid="apply-button"]
-                try:
-                    apply_button = wait.until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[data-testid="apply-button"]'))
-                    )
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", apply_button)
-                    time.sleep(0.2)
-                    try:
-                        apply_button.click()
-                    except Exception:
-                        driver.execute_script("arguments[0].click();", apply_button)
-                    click_success = True
-                except Exception as e:
-                    print(f"Failed to click Apply button: {e}")
-                    click_success = False
-
-            elif apply_kind == "anchor":
-                # Anchor <a> with data-testid="apply-button" (can be anywhere in page)
-                try:
-                    easy_apply_link = wait.until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, 'a[data-testid="apply-button"]'))
-                    )
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", easy_apply_link)
-                    time.sleep(0.3)
-                    try:
-                        wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'a[data-testid="apply-button"]')))
-                        easy_apply_link.click()
-                    except Exception:
-                        driver.execute_script("arguments[0].click();", easy_apply_link)
-                    click_success = True
-                except Exception as e:
-                    print(f"Failed to click Apply link: {e}")
-                    click_success = False
-
-            else:
-                # Legacy: shadow-DOM web component click
-                click_success = driver.execute_script("""
-                    const applyButtonWc = document.querySelector('apply-button-wc');
-                    if (!applyButtonWc || !applyButtonWc.shadowRoot) return false;
-
-                    const easyApplyBtn =
-                        applyButtonWc.shadowRoot.querySelector('button.btn.btn-primary') ||
-                        (applyButtonWc.shadowRoot.querySelector('apply-button') &&
-                         applyButtonWc.shadowRoot.querySelector('apply-button').shadowRoot &&
-                         applyButtonWc.shadowRoot.querySelector('apply-button').shadowRoot.querySelector('button.btn.btn-primary')) ||
-                        Array.from(applyButtonWc.shadowRoot.querySelectorAll('button')).find(btn =>
-                            (btn.textContent || '').toLowerCase().includes('easy apply') ||
-                            (btn.textContent || '').toLowerCase().includes('apply now')
-                        );
-
-                    if (!easyApplyBtn) return false;
-                    easyApplyBtn.click();
-                    return true;
-                """)
-
-            if click_success:
-                # Continue with the application process
-                try:
-                    # Dice "Easy Apply" is a multi-step wizard. Keep clicking "Next" until "Submit" appears.
-                    next_locator = (
-                        By.XPATH,
-                        "//button[not(@disabled) and (@type='submit' or @type='button') and "
-                        "(normalize-space(.)='Next' or .//span[normalize-space()='Next'])]",
-                    )
-                    submit_locator = (
-                        By.XPATH,
-                        "//button[not(@disabled) and (@type='submit' or @type='button') and "
-                        "(normalize-space(.)='Submit' or .//span[normalize-space()='Submit'])]",
-                    )
-
-                    # Fast polling so we click as soon as buttons appear (avoid long "Submit" waits)
-                    step_wait = WebDriverWait(driver, 12, poll_frequency=0.2)
-                    max_steps = 10
-                    submitted = False
-
-                    for _ in range(max_steps):
-                        # Check immediately for Submit/Next (no blocking waits that delay Next)
-                        submit_candidates = driver.find_elements(*submit_locator)
-                        submit_button = next((b for b in submit_candidates if b.is_displayed() and b.is_enabled()), None)
-                        if submit_button:
-                            driver.execute_script(
-                                "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});",
-                                submit_button,
-                            )
-                            time.sleep(0.1)
-                            try:
-                                submit_button.click()
-                            except Exception:
-                                driver.execute_script("arguments[0].click();", submit_button)
-                            submitted = True
-                            break
-
-                        next_candidates = driver.find_elements(*next_locator)
-                        next_button = next((b for b in next_candidates if b.is_displayed() and b.is_enabled()), None)
-                        if next_button:
-                            driver.execute_script(
-                                "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});",
-                                next_button,
-                            )
-                            time.sleep(0.1)
-                            try:
-                                next_button.click()
-                            except Exception:
-                                driver.execute_script("arguments[0].click();", next_button)
-                        else:
-                            # Neither button is ready yet; wait (fast poll) until one becomes clickable.
-                            def _ready_button(d):
-                                for loc in (submit_locator, next_locator):
-                                    try:
-                                        el = d.find_element(*loc)
-                                        if el.is_displayed() and el.is_enabled():
-                                            return el
-                                    except Exception:
-                                        continue
-                                return False
-
-                            step_wait.until(_ready_button)
-                            continue
-
-                        # Let the wizard step render/hydrate (staleness isn't always reliable with React)
-                        time.sleep(0.5)
-                    
-                    # Wait for confirmation (Dice has multiple success UIs)
-                    try:
-                        confirmation_wait = WebDriverWait(driver, 30)
-                        confirmation_wait.until(
-                            EC.presence_of_element_located(
-                                (
-                                    By.CSS_SELECTOR,
-                                    '[data-testid="job-application-success-card"]',
-                                )
-                            )
-                        )
-                        print(f"Application confirmed for New Job: {job_url}")
-                        applied = True
-                    except Exception:
-                        # Backwards-compatible fallback for older Dice success banner
-                        try:
-                            confirmation_wait = WebDriverWait(driver, 15)
-                            confirmation_wait.until(
-                                EC.presence_of_element_located(
-                                    (
-                                        By.XPATH,
-                                        "//header[contains(@class, 'post-apply-banner')]//h1[contains(text(), 'Application submitted')]",
-                                    )
-                                )
-                            )
-                            print(f"Application confirmed for New Job: {job_url}")
-                            applied = True
-                        except Exception as e:
-                            print(f"Could not confirm application submission: {e}")
-                            applied = submitted
-                        
-                except Exception as e:
-                    applied = False
-            else:
-                print("Failed to click Easy apply button")
-                applied = False
-        else:
-            print(f"Unknown shadow DOM state: {status}")
-            applied = False
-            
-    except Exception as e:
-        print(f"Error in application process: {e}")
-        applied = False
-        
-    # Always return to the original URL
-    driver.get(original_url)
-    return applied
+        result = ApplicationResult(
+            ApplicationStatus.FAILED,
+            "Dice Easy Apply did not reach a confirmed Submit step.",
+            resume_profile=profile,
+            match_score=score,
+            resume_filename=prepared_path.name if resume_uploaded else "",
+        )
+        return result
+    except Exception as exc:
+        result = ApplicationResult(
+            ApplicationStatus.FAILED,
+            f"Application flow failed: {type(exc).__name__}.",
+        )
+        return result
+    finally:
+        _record_resume_metadata(job, result)
+        if navigated and original_url:
+            try:
+                driver.get(original_url)
+            except Exception:
+                pass
 
 def fetch_jobs_with_requests(driver, search_query, include_keywords=None, exclude_keywords=None):
     """
     Use the existing browser instance to fetch job listings.
     """
+    require_dice_automation_authorized()
     print(f"Fetching jobs for query: {search_query}")
     
     # Format search parameters for URL
@@ -511,10 +726,6 @@ def fetch_jobs_with_requests(driver, search_query, include_keywords=None, exclud
                 else:
                     print(f"Failed to load initial page after {max_retries} attempts.")
                     raise e
-        
-        # Move mouse to prevent system sleeping
-        pyautogui.moveRel(1, 1, duration=0.1)
-        pyautogui.moveRel(-1, -1, duration=0.1)
         
         # Get total jobs count
         total_pages = 1
@@ -639,6 +850,7 @@ def fetch_jobs_with_requests(driver, search_query, include_keywords=None, exclud
                         
                         # Create job entry
                         job_entry = {
+                            "Job ID": job_id or job_guid,
                             "Job Title": job_title,
                             "Job URL": job_url,
                             "Company": company_name,
@@ -703,218 +915,11 @@ def save_to_excel(job_data, filename="job_application_report.xlsx"):
         print(f"Error saving to Excel: {e}")
 
 def main():
-    # Record the start time of the entire script
-    script_start_time = time.time()
-    
-    # Disable PyAutoGUI failsafe to prevent accidental triggering
-    pyautogui.FAILSAFE = False
-    
-    driver = get_web_driver()  # Use browser
-    
-    # Define file names for fresh start
-    applied_jobs_file = "applied_jobs.xlsx"
-    not_applied_jobs_file = "not_applied_jobs.xlsx"
-    job_report_file = "job_application_report.xlsx"
-    excluded_jobs_file = "excluded_jobs.xlsx"
- 
-    # Delete existing files before login to start fresh (excluding applied_jobs.xlsx)
-    for file in [not_applied_jobs_file, job_report_file, excluded_jobs_file]:
-        if os.path.exists(file):
-            os.remove(file)
-            
-    # Ensure applied_jobs.xlsx exists before writing
-    if not os.path.exists(applied_jobs_file):
-        df_empty = pd.DataFrame(columns=["Job Title", "Job URL", "Company", "Location", "Employment Type", "Posted Date", "Applied"])
-        df_empty.to_excel(applied_jobs_file, index=False)
+    """Keep the supported entry point explicit and avoid a second unsafe workflow."""
 
-    job_data = {
-        "Total Jobs Posted Today": 0,
-        "jobs": []
-    }
-
-    try:
-        # Record login start time
-        login_start_time = time.time()
-        
-        if login_to_dice(driver):
-            login_time = time.time() - login_start_time
-            print(f"Login successful in {login_time:.2f} seconds. Starting job search...")
-
-            # Move mouse to prevent system sleeping
-            pyautogui.moveRel(1, 1, duration=0.1)
-            pyautogui.moveRel(-1, -1, duration=0.1)
-
-            # Use existing driver to fetch jobs
-            collected_jobs = {}  # Dictionary to hold unique jobs by URL
-            excluded_jobs = []   # List to hold excluded jobs
-            fetch_start_time = time.time()
-            
-            for query in DICE_SEARCH_QUERIES:
-                # Pass the existing driver to fetch_jobs_with_requests
-                included_jobs, query_excluded_jobs = fetch_jobs_with_requests(driver, query, INCLUDE_KEYWORDS, EXCLUDE_KEYWORDS)
-                
-                # Add each job to the collected jobs dictionary
-                for job in included_jobs:
-                    if job["Job URL"] not in collected_jobs:
-                        collected_jobs[job["Job URL"]] = job
-                
-                # Add to excluded jobs list
-                excluded_jobs.extend(query_excluded_jobs)
-                
-                print(f"Query '{query}' returned {len(included_jobs)} jobs")
-                
-                # Mouse movement between queries to prevent sleep
-                pyautogui.moveRel(1, 1, duration=0.1)
-                pyautogui.moveRel(-1, -1, duration=0.1)
-                
-            fetch_time = time.time() - fetch_start_time
-            print(f"Finished fetching jobs in {fetch_time:.2f} seconds")
-
-            # Save excluded jobs to Excel
-            if excluded_jobs:
-                df_excluded = pd.DataFrame(excluded_jobs)
-                df_excluded.to_excel(excluded_jobs_file, index=False)
-                print(f"Saved {len(excluded_jobs)} excluded jobs to {excluded_jobs_file}")
-
-            # Merge all job details into job_data
-            job_data["jobs"] = list(collected_jobs.values())
-            print(f"==========> Total unique jobs collected from all queries: {len(job_data['jobs'])}")
-            
-            # Rest of your code stays the same...
-            # Check for already applied jobs
-            if not os.path.exists(not_applied_jobs_file):
-                df_empty = pd.DataFrame(columns=["Job Title", "Job URL", "Company", "Location", "Employment Type", "Posted Date", "Applied"])
-                df_empty.to_excel(not_applied_jobs_file, index=False)
-                
-            existing_applied_jobs = set()
-            existing_not_applied_jobs = set()
-
-            if os.path.exists(applied_jobs_file):
-                try:
-                    df_applied = pd.read_excel(applied_jobs_file)
-                    existing_applied_jobs = set(df_applied["Job URL"].dropna())
-                except Exception as e:
-                    print(f"Error loading existing applied jobs: {e}")
-
-            if os.path.exists(not_applied_jobs_file):
-                try:
-                    df_not_applied = pd.read_excel(not_applied_jobs_file)
-                    existing_not_applied_jobs = set(df_not_applied["Job URL"].dropna())
-                except Exception as e:
-                    print(f"Error loading not applied jobs: {e}")
-
-            # Count already applied jobs
-            already_applied_count = sum(1 for job in job_data["jobs"] if job["Job URL"] in existing_applied_jobs)
-            print(f"==========> Skipping jobs that were already applied: {already_applied_count}")
-
-            # Filter jobs before applying
-            pending_jobs = [job for job in job_data["jobs"] if job["Job URL"] not in existing_applied_jobs]
-            print(f"==========> Total jobs to apply for: {len(pending_jobs)}")
-            
-            # Calculate and display the estimated time
-            print(f"==========> Estimated time to apply all {len(pending_jobs)} jobs: {len(pending_jobs)//8//60} hours {len(pending_jobs)//8%60} minutes")
-            
-            # Record application start time
-            apply_start_time = time.time()
-            successful_applications = 0
-            failed_applications = 0
-            
-            # Process only pending jobs
-            for job_index, job in enumerate(pending_jobs):
-                # Move mouse every 3 jobs to prevent system sleeping
-                if job_index % 3 == 0:
-                    pyautogui.moveRel(1, 1, duration=0.1)
-                    pyautogui.moveRel(-1, -1, duration=0.1)
-                
-                job_start_time = time.time()
-                
-                if not job["Applied"] and job["Job URL"] != "Unknown":
-                    applied = apply_to_job_url(driver, job["Job URL"])
-                    job["Applied"] = applied
-                    
-                    job_time = time.time() - job_start_time
-                    
-                    if applied:
-                        successful_applications += 1
-                        try:
-                            df_existing = pd.read_excel(applied_jobs_file)
-                        except Exception:
-                            df_existing = pd.DataFrame(columns=["Job Title", "Job URL", "Company", "Location", "Employment Type", "Posted Date", "Applied"])
-                        df_new = pd.DataFrame([job])
-                        df_combined = pd.concat([df_existing, df_new], ignore_index=True)
-                        df_combined.to_excel(applied_jobs_file, index=False)
-                    else:
-                        failed_applications += 1
-                        try:
-                            df_existing = pd.read_excel(not_applied_jobs_file)
-                        except Exception:
-                            df_existing = pd.DataFrame(columns=["Job Title", "Job URL", "Company", "Location", "Employment Type", "Posted Date", "Applied"])
-                        df_new = pd.DataFrame([job])
-                        df_combined = pd.concat([df_existing, df_new], ignore_index=True)
-                        df_combined.to_excel(not_applied_jobs_file, index=False)
-                    
-                    # Print progress every 5 jobs
-                    if (job_index + 1) % 5 == 0 or job_index == len(pending_jobs) - 1:
-                        elapsed = time.time() - apply_start_time
-                        progress = (job_index + 1) / len(pending_jobs) * 100
-                        estimated_total = elapsed / (job_index + 1) * len(pending_jobs)
-                        remaining = estimated_total - elapsed
-                        
-                        print(f"Progress: {job_index+1}/{len(pending_jobs)} jobs ({progress:.1f}%) | "
-                              f"Last job: {job_time:.1f}s | "
-                              f"Success rate: {successful_applications}/{job_index+1} | "
-                              f"Est. remaining: {remaining/60:.1f} mins")
-
-            apply_time = time.time() - apply_start_time
-            applications_per_minute = (successful_applications + failed_applications) / (apply_time / 60) if apply_time > 0 else 0
-            print(f"\n==========> Application phase completed in {apply_time:.2f} seconds")
-            print(f"==========> Successfully applied: {successful_applications} jobs")
-            print(f"==========> Failed applications: {failed_applications} jobs")
-            print(f"==========> Average application rate: {applications_per_minute:.2f} jobs per minute")
-
-            # Save final data to JSON
-            with open("job_data.json", "w") as json_file:
-                json.dump(job_data, json_file, indent=4)
-            print("Job data saved to job_data.json")
-
-            # Final save to Excel
-            save_to_excel(job_data)
-
-        else:
-            print("Login failed. Exiting...")
-
-    except Exception as e:
-        print(f"An error occurred: {e}")
-    finally:
-        pass
-        # Don't close the browser immediately for debugging
-        # driver.quit()
-        
-    # Calculate and print total execution time
-    total_time = time.time() - script_start_time
-    hours, remainder = divmod(total_time, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    
-    print("\n===== EXECUTION TIME SUMMARY =====")
-    print(f"Total script execution time: {int(hours)}h {int(minutes)}m {seconds:.2f}s")
-    if 'pending_jobs' in locals() and pending_jobs:
-        print(f"Average time per job processed: {total_time/len(pending_jobs):.2f} seconds")
-    print("==================================")
+    raise SystemExit("Run the configured Tkinter application with: python run.py")
 
 
 
 if __name__ == "__main__":
-    # Search in dice
-    DICE_SEARCH_QUERIES = ["AI ML", "Gen AI", "Agentic AI", "Data Engineer", "Data Analyst", "Machine Learning"]  # You can update this list anytime
-
-    # Optional: Define keywords for filtering job applications
-    EXCLUDE_KEYWORDS = ["Manager", "Director",".net", "SAP","java","w2 only","only w2","no c2c",
-        "only on w2","w2 profiles only","tester","f2f"]  # Add more if needed
-    INCLUDE_KEYWORDS = ["AI", "Artificial","Inteligence","Machine","Learning", "ML", "Data", "NLP", "ETL",
-        "Natural Language Processing","analyst","scientist","senior","cloud", 
-        "aws","gcp","Azure","agentic","python","rag","llm"]  # Add more if needed
-
-    start_time = datetime.datetime.now()
     main()
-    end_time = datetime.datetime.now()
-    print(f"Exact Execution time: {end_time - start_time}")

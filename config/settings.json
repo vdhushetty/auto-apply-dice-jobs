@@ -45,5 +45,15 @@
         "llm"
     ],
     "headless_mode": false,
-    "job_application_limit": 2000
+    "job_application_limit": 25,
+    "run_mode": "preview",
+    "resume_mode": "static",
+    "resume_paths": {
+        "aws": "",
+        "azure": "",
+        "gcp": ""
+    },
+    "minimum_match_score": 35,
+    "minimum_winner_margin": 5,
+    "tailored_resume_output_dir": ".data/tailored_resumes"
 }

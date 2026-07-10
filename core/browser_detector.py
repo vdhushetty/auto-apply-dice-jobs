@@ -1,6 +1,6 @@
 import os
 import platform
-import subprocess
+import shutil
 import glob
 from pathlib import Path
 from dotenv import load_dotenv, set_key, find_dotenv
@@ -8,7 +8,7 @@ from dotenv import load_dotenv, set_key, find_dotenv
 def detect_browser_paths():
     """
     Detects browser paths on the current system (macOS or Windows) and updates .env file.
-    Searches in this order: Brave, Chrome, Safari, Edge, Firefox.
+    Searches for Chromium-family browsers compatible with ChromeDriver.
     
     Returns:
         str: The path to the detected browser or None if no browser is found.
@@ -117,36 +117,21 @@ def detect_browser_paths():
                     # print(f"Found {browser} at: {path}")
                     break  # Take first found instance of each browser
 
-    # Try to detect browsers using command line on Windows or Unix-like
+    # Try PATH lookup without invoking a shell.
     if not browser_paths:
-        try:
-            if system == 'Windows':
-                # Try using where command on Windows
-                for browser in ["brave", "chrome", "msedge", "firefox"]:
-                    try:
-                        result = subprocess.run(f'where {browser}', shell=True, capture_output=True, text=True)
-                        if result.returncode == 0 and result.stdout.strip():
-                            path = result.stdout.strip().split('\n')[0]  # Take first result
-                            browser_name = browser.capitalize()
-                            if browser == "msedge":
-                                browser_name = "Edge"
-                            browser_paths[browser_name] = path
-                            # print(f"Found {browser_name} at: {path}")
-                    except Exception:
-                        pass
-            else:
-                # Try using which command on Unix-like
-                for browser in ["brave", "chrome", "chromium", "firefox", "safari"]:
-                    try:
-                        result = subprocess.run(f'which {browser}', shell=True, capture_output=True, text=True)
-                        if result.returncode == 0 and result.stdout.strip():
-                            browser_name = browser.capitalize()
-                            browser_paths[browser_name] = result.stdout.strip()
-                            # print(f"Found {browser_name} at: {result.stdout.strip()}")
-                    except Exception:
-                        pass
-        except Exception as e:
-            print(f"Error detecting browser using command line: {e}")
+        commands = (
+            ("brave", "Brave"),
+            ("brave-browser", "Brave"),
+            ("google-chrome", "Chrome"),
+            ("google-chrome-stable", "Chrome"),
+            ("chrome", "Chrome"),
+            ("chromium", "Chromium"),
+            ("chromium-browser", "Chromium"),
+        )
+        for command, browser_name in commands:
+            path = shutil.which(command)
+            if path and browser_name not in browser_paths:
+                browser_paths[browser_name] = path
     
     # IMPORTANT CHANGE: Always clear the existing browser path in .env to force detection
     from dotenv import set_key, find_dotenv
@@ -155,8 +140,8 @@ def detect_browser_paths():
         load_dotenv(dotenv_path)  # Load first to get other variables
         set_key(dotenv_path, "WEB_BROWSER_PATH", "")  # Clear the browser path
     
-    # Order of preference: Brave, Chrome, Safari, Edge, Firefox
-    preferred_order = ["Brave", "Chrome", "Safari", "Edge", "Firefox"]
+    # ChromeDriver supports these Chromium-family browser binaries.
+    preferred_order = ["Brave", "Chrome", "Chromium"]
     
     # Return the first browser found in the preferred order
     selected_browser = None
@@ -205,6 +190,8 @@ def update_env_file(browser_path):
         # print(f"WEB_BROWSER_PATH already set to: {browser_path}")
         pass
     
+    if os.name != "nt":
+        os.chmod(dotenv_path, 0o600)
     return browser_path
 
 def get_browser_path():

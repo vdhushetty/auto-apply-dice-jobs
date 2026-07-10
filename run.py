@@ -13,13 +13,6 @@ def main():
     if script_dir not in sys.path:
         sys.path.insert(0, script_dir)
     
-    # Fix chromedriver permissions
-    try:
-        from fix_chromedriver import fix_chromedriver_permissions
-        fix_chromedriver_permissions()
-    except Exception as e:
-        print(f"Warning: Could not fix ChromeDriver permissions: {e}")
-    
     # Import and run the main app
     try:
         from app_tkinter import main

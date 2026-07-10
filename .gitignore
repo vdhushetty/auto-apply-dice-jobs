@@ -5,18 +5,31 @@ __pycache__/
 *.so
 .Python
 venv/
+.venv/
 ENV/
 .env
+.env.*
+!.env.example
 
 # Excel and data files
 *.xlsx
 *.xls
 job_data.json
 job_application_summary.json
-*.txt
+config/settings.local.json
+.data/
 
 # Logs
 logs/*.log
+coverage.xml
+htmlcov/
+.coverage
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+*.egg-info/
 
 # macOS system files
 .DS_Store
