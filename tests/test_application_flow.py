@@ -12,13 +12,17 @@ from core.main_script import (
     ApplicationStatus,
     RunMode,
     apply_to_job_url,
+    build_diverse_candidate_pool,
+    candidate_bucket_limits,
     fetch_jobs_with_requests,
+    rank_eligible_jobs,
 )
 from core.resumes.models import (
     CloudProfile,
     MatchDecision,
     PreparedResume,
     ResumePreparation,
+    ResumeTailoringError,
 )
 
 
@@ -140,6 +144,54 @@ class ImmediateWait:
         raise TimeoutError("condition not met")
 
 
+class SearchCard:
+    def __init__(self, index: int) -> None:
+        self.index = index
+
+    def get_attribute(self, name: str) -> str:
+        if name == "data-id":
+            return f"id-{self.index}"
+        if name == "data-job-guid":
+            return f"guid-{self.index}"
+        return ""
+
+    def find_element(self, by: str, selector: str) -> FakeElement:
+        if selector == "a[data-testid='job-search-job-detail-link']":
+            return FakeElement(f"Job {self.index}")
+        if selector == "a[href*='company-profile'] p":
+            return FakeElement("Example Company")
+        if selector == "p#employmentType-label":
+            return FakeElement("Contract")
+        raise RuntimeError(f"Unexpected selector: {selector}")
+
+    def find_elements(self, by: str, selector: str) -> list[FakeElement]:
+        if selector == "p.text-sm.font-normal.text-zinc-600":
+            return [FakeElement("Remote")]
+        return []
+
+
+class SearchDriver(FakeDriver):
+    def __init__(self, first_page_size: int) -> None:
+        super().__init__()
+        self.cards = [SearchCard(index) for index in range(first_page_size)]
+
+    def find_element(self, by: str, selector: str):  # type: ignore[no-untyped-def]
+        if by == "tag name" and selector == "body":
+            return FakeElement("ready")
+        if by == "xpath":
+            return FakeElement("102 results")
+        if by == "css selector" and selector == "div[data-id][data-job-guid]":
+            cards = self.find_elements(by, selector)
+            if cards:
+                return cards[0]
+        raise RuntimeError("element not found")
+
+    def find_elements(self, by: str, selector: str):  # type: ignore[no-untyped-def]
+        if selector == "div[data-id][data-job-guid]" and "page=2" not in self.current_url:
+            return self.cards
+        return []
+
+
 @dataclass
 class SkipService:
     def prepare(self, job):  # type: ignore[no-untyped-def]
@@ -171,6 +223,18 @@ class PreparedService:
 
 
 @dataclass
+class GuardedPreparedService(PreparedService):
+    fail_on_guard_call: int = 1
+    guard_calls: int = 0
+
+    def assert_prepared_resume_approved(self, job, prepared):  # type: ignore[no-untyped-def]
+        self.guard_calls += 1
+        if self.guard_calls == self.fail_on_guard_call:
+            raise ResumeTailoringError("AI resume hash no longer matches its approval.")
+        return "approved-digest"
+
+
+@dataclass
 class EvaluatingService:
     evaluate_called: bool = False
     prepare_called: bool = False
@@ -193,6 +257,40 @@ class EvaluatingService:
     def prepare(self, job):  # type: ignore[no-untyped-def]
         self.prepare_called = True
         raise AssertionError("preview must not prepare a resume")
+
+
+@dataclass
+class RankingService:
+    evaluations: dict[str, ResumePreparation]
+    postings: list[Any]
+
+    def evaluate(self, job):  # type: ignore[no-untyped-def]
+        self.postings.append(job)
+        return self.evaluations[job.title]
+
+    def prepare(self, job):  # type: ignore[no-untyped-def]
+        raise AssertionError("candidate ranking must never prepare a resume")
+
+
+def ranking_evaluation(
+    score: float,
+    *,
+    eligible: bool = True,
+    manual_review_reasons: tuple[str, ...] = (),
+) -> ResumePreparation:
+    decision = MatchDecision(
+        selected_profile=CloudProfile.AWS,
+        selected_path=Path("/tmp/aws.docx"),
+        score=score,
+        threshold=35,
+        eligible=eligible,
+        manual_review_reasons=manual_review_reasons,
+    )
+    return ResumePreparation(
+        eligible=eligible,
+        reason=decision.reason,
+        decision=decision,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -310,6 +408,95 @@ def test_verify_upload_never_clicks_next_or_submit(monkeypatch, tmp_path: Path) 
     assert driver.next_button is not None and not driver.next_button.clicked
     assert not driver.submit_button.clicked
     assert driver.current_url == "https://www.dice.com/jobs?q=data"
+
+
+def test_approval_drift_before_apply_is_skipped(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    resume = tmp_path / "ai.docx"
+    resume.touch()
+    driver = WizardDriver(has_file_input=True)
+    service = GuardedPreparedService(resume, fail_on_guard_call=1)
+    monkeypatch.setattr(main_script, "_extract_job_description", lambda current: "AWS " * 50)
+    monkeypatch.setattr(main_script, "WebDriverWait", ImmediateWait)
+    job = {
+        "Job Title": "AWS Engineer",
+        "Job URL": "https://www.dice.com/job-detail/guard-before-apply",
+    }
+
+    result = apply_to_job_url(driver, job, service)  # type: ignore[arg-type]
+
+    assert result.status is ApplicationStatus.SKIPPED
+    assert "hash no longer matches" in result.reason
+    assert service.guard_calls == 1
+    assert not driver.apply_control.clicked
+    assert driver.file_input is not None and not driver.file_input.selected_file_name
+
+
+def test_approval_drift_immediately_before_upload_is_skipped(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    resume = tmp_path / "ai.docx"
+    resume.touch()
+    driver = WizardDriver(has_file_input=True)
+    service = GuardedPreparedService(resume, fail_on_guard_call=2)
+    monkeypatch.setattr(main_script, "_extract_job_description", lambda current: "AWS " * 50)
+    monkeypatch.setattr(main_script, "WebDriverWait", ImmediateWait)
+    job = {
+        "Job Title": "AWS Engineer",
+        "Job URL": "https://www.dice.com/job-detail/guard-before-upload",
+    }
+
+    result = apply_to_job_url(driver, job, service)  # type: ignore[arg-type]
+
+    assert result.status is ApplicationStatus.SKIPPED
+    assert "hash no longer matches" in result.reason
+    assert service.guard_calls == 2
+    assert driver.apply_control.clicked
+    assert driver.file_input is not None and not driver.file_input.selected_file_name
+
+
+def test_approval_is_checked_after_browser_filename_verification(
+    monkeypatch, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    resume = tmp_path / "ai.docx"
+    resume.touch()
+    driver = WizardDriver(has_file_input=True)
+    service = GuardedPreparedService(resume, fail_on_guard_call=3)
+    monkeypatch.setattr(main_script, "_extract_job_description", lambda current: "AWS " * 50)
+    monkeypatch.setattr(main_script, "WebDriverWait", ImmediateWait)
+    job = {
+        "Job Title": "AWS Engineer",
+        "Job URL": "https://www.dice.com/job-detail/guard-after-upload",
+    }
+
+    result = apply_to_job_url(
+        driver,
+        job,
+        service,  # type: ignore[arg-type]
+        run_mode=RunMode.VERIFY_UPLOAD,
+    )
+
+    assert result.status is ApplicationStatus.SKIPPED
+    assert service.guard_calls == 3
+    assert driver.file_input is not None and driver.file_input.selected_file_name == resume.name
+    assert not driver.submit_button.clicked
+
+
+def test_approval_is_checked_again_immediately_before_submit(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    resume = tmp_path / "ai.docx"
+    resume.touch()
+    driver = WizardDriver(has_file_input=True)
+    service = GuardedPreparedService(resume, fail_on_guard_call=4)
+    monkeypatch.setattr(main_script, "_extract_job_description", lambda current: "AWS " * 50)
+    monkeypatch.setattr(main_script, "WebDriverWait", ImmediateWait)
+    job = {
+        "Job Title": "AWS Engineer",
+        "Job URL": "https://www.dice.com/job-detail/guard-before-submit",
+    }
+
+    result = apply_to_job_url(driver, job, service)  # type: ignore[arg-type]
+
+    assert result.status is ApplicationStatus.SKIPPED
+    assert service.guard_calls == 4
+    assert driver.file_input is not None and driver.file_input.selected_file_name == resume.name
+    assert not driver.submit_button.clicked
 
 
 def test_stale_page_text_cannot_verify_upload(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
@@ -431,3 +618,138 @@ def test_live_adapters_require_authorization(monkeypatch, tmp_path: Path) -> Non
         fetch_jobs_with_requests(driver, "AWS Engineer")
 
     assert driver.visited == []
+
+
+def test_diverse_candidate_pool_is_bounded_stable_and_round_robin() -> None:
+    shared = {
+        "Job Title": "Shared",
+        "Job URL": "https://www.dice.com/job-detail/shared",
+    }
+    buckets = [
+        [
+            {"Job Title": "A1", "Job URL": "https://www.dice.com/job-detail/a1"},
+            {"Job Title": "A2", "Job URL": "https://www.dice.com/job-detail/a2"},
+        ],
+        [
+            {"Job Title": "B1", "Job URL": "https://www.dice.com/job-detail/b1"},
+            shared,
+        ],
+        [
+            {"Job Title": "C1", "Job URL": "https://www.dice.com/job-detail/c1"},
+            shared,
+        ],
+    ]
+
+    pool = build_diverse_candidate_pool(
+        buckets,
+        application_limit=1,
+        pool_multiplier=4,
+    )
+
+    assert [job["Job Title"] for job in pool] == ["A1", "B1", "C1", "A2"]
+
+
+def test_candidate_budget_is_even_and_verify_upload_includes_each_query() -> None:
+    assert candidate_bucket_limits(6, application_limit=10) == (7, 7, 7, 7, 6, 6)
+    assert candidate_bucket_limits(6, application_limit=1) == (1, 1, 1, 1, 1, 1)
+    assert candidate_bucket_limits(0, application_limit=10) == ()
+
+
+def test_page_count_uses_observed_dice_page_size() -> None:
+    assert main_script._bounded_page_count(201, 34, max_pages=None) == 6
+    assert main_script._bounded_page_count(201, 34, max_pages=2) == 2
+    assert main_script._bounded_page_count(40, 0, max_pages=None) == 2
+
+
+def test_job_fetch_stops_after_first_empty_results_page(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    driver = SearchDriver(first_page_size=34)
+    monkeypatch.setattr(main_script, "WebDriverWait", ImmediateWait)
+    monkeypatch.setattr(main_script.time, "sleep", lambda seconds: None)
+
+    jobs, excluded = fetch_jobs_with_requests(driver, "Data Engineer")
+
+    assert len(jobs) == 34
+    assert excluded == []
+    assert any("page=2" in url for url in driver.visited)
+    assert not any("page=3" in url for url in driver.visited)
+
+
+def test_candidate_cap_selects_highest_full_description_scores_stably(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    driver = FakeDriver()
+    descriptions = {
+        "https://www.dice.com/job-detail/low": "low description " * 20,
+        "https://www.dice.com/job-detail/high-first": "first high description " * 20,
+        "https://www.dice.com/job-detail/high-second": "second high description " * 20,
+    }
+    monkeypatch.setattr(
+        main_script,
+        "_extract_job_description",
+        lambda current: descriptions[current.current_url],
+    )
+    service = RankingService(
+        evaluations={
+            "Low": ranking_evaluation(45),
+            "High First": ranking_evaluation(91),
+            "High Second": ranking_evaluation(91),
+        },
+        postings=[],
+    )
+    jobs = [
+        {"Job Title": "Low", "Job URL": "https://www.dice.com/job-detail/low"},
+        {
+            "Job Title": "High First",
+            "Job URL": "https://www.dice.com/job-detail/high-first",
+        },
+        {
+            "Job Title": "High Second",
+            "Job URL": "https://www.dice.com/job-detail/high-second",
+        },
+    ]
+
+    result = rank_eligible_jobs(driver, jobs, service, limit=2)  # type: ignore[arg-type]
+
+    assert [job["Job Title"] for job in result.selected_jobs] == [
+        "High First",
+        "High Second",
+    ]
+    assert [job["Job Title"] for job in result.deferred_jobs] == ["Low"]
+    assert [posting.description for posting in service.postings] == [
+        descriptions[job["Job URL"]] for job in jobs
+    ]
+    assert all("Job Description" not in job for job in jobs)
+    assert driver.current_url == "https://www.dice.com/jobs?q=data"
+
+
+def test_candidate_ranking_rejects_ineligible_and_manual_review_jobs(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    driver = FakeDriver()
+    monkeypatch.setattr(main_script, "_extract_job_description", lambda current: "AWS " * 50)
+    service = RankingService(
+        evaluations={
+            "Safe": ranking_evaluation(70),
+            "Below Threshold": ranking_evaluation(20, eligible=False),
+            "Clearance": ranking_evaluation(
+                95,
+                manual_review_reasons=("clearance requirement",),
+            ),
+        },
+        postings=[],
+    )
+    jobs = [
+        {"Job Title": title, "Job URL": f"https://www.dice.com/job-detail/{index}"}
+        for index, title in enumerate(("Below Threshold", "Clearance", "Safe"), start=1)
+    ]
+
+    result = rank_eligible_jobs(driver, jobs, service, limit=3)  # type: ignore[arg-type]
+
+    assert [job["Job Title"] for job in result.selected_jobs] == ["Safe"]
+    assert {job["Job Title"] for job in result.rejected_jobs} == {
+        "Below Threshold",
+        "Clearance",
+    }
+    assert all(
+        job["Application Status"] == ApplicationStatus.SKIPPED.value for job in result.rejected_jobs
+    )

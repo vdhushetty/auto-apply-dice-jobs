@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
 from docx import Document
 
+from core.resumes.bullet_curator import EditableBullet
 from core.resumes.documents import SkillSlot
 from core.resumes.models import JobPosting, ResumeConfigurationError, ResumeTailoringError
 from core.resumes.service import ResumeService
@@ -46,6 +48,61 @@ class CountingReversePlanner(ReversePlanner):
     def plan(self, job: JobPosting, slots: tuple[SkillSlot, ...]) -> dict[str, Any]:
         self.calls += 1
         return super().plan(job, slots)
+
+
+class AIBulletPlanner:
+    model = "fake-ai-model"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def plan(self, job: JobPosting, bullets: Sequence[EditableBullet]) -> dict[str, Any]:
+        self.calls += 1
+        target = bullets[0]
+        return {
+            "schema_version": "1",
+            "outcome": "rewrite",
+            "reason_code": "ok",
+            "job_evidence": [{"quote": "AWS", "priority": "required"}],
+            "edits": [
+                {
+                    "bullet_id": target.bullet_id,
+                    "replacement_bullets": [
+                        "Built reliable AWS data pipelines with Python and SQL for governed "
+                        "business reporting."
+                    ],
+                    "source_bullet_ids": [target.bullet_id],
+                }
+            ],
+        }
+
+
+class ExplodingAIBulletPlanner:
+    model = "fake-ai-model"
+
+    def plan(self, job: JobPosting, bullets: Sequence[EditableBullet]) -> dict[str, Any]:
+        raise AssertionError("AI planner must not run during evaluation")
+
+
+def make_ai_resume(path: Path) -> Path:
+    document = Document()
+    document.add_heading("Professional Summary", level=1)
+    document.add_paragraph(
+        "Data engineer with production experience building reliable analytics platforms and "
+        "governed reporting systems for business stakeholders."
+    )
+    document.add_heading("Professional Experience", level=1)
+    document.add_paragraph("Senior Data Engineer | Example Company")
+    document.add_paragraph(
+        "Built AWS data pipelines with Python and SQL for reliable business reporting.",
+        style="List Bullet",
+    )
+    document.add_paragraph(
+        "Automated data quality checks and monitored production batch workflows.",
+        style="List Bullet",
+    )
+    document.save(path)
+    return path
 
 
 def make_paths(resume_factory) -> dict[str, str]:  # type: ignore[no-untyped-def]
@@ -286,3 +343,194 @@ def test_low_match_skips_before_curation(resume_factory, tmp_path: Path) -> None
 
     assert not result.eligible
     assert result.prepared is None
+
+
+def test_ai_bullets_uses_one_resume_and_hash_bound_review(tmp_path: Path) -> None:
+    source = make_ai_resume(tmp_path / "base.docx")
+    planner = AIBulletPlanner()
+    reviews: list[tuple[str, Path, str]] = []
+
+    def approve(job: JobPosting, path: Path, digest: str) -> bool:
+        reviews.append((job.title, path, digest))
+        return True
+
+    service = ResumeService.from_settings(
+        {
+            "resume_mode": "ai_bullets",
+            "ai_resume_path": str(source),
+            "ai_resume_output_dir": str(tmp_path / "ai-out"),
+            "minimum_match_score": 20,
+        },
+        bullet_planner=planner,
+        api_key="sk-test-secret-not-real",
+        layout_verifier=lambda source_path, output_path: None,
+        review_callback=approve,
+    )
+    job = JobPosting(
+        title="AWS Data Engineer",
+        description="Required: AWS, Python, and SQL data pipeline experience.",
+        url="https://www.dice.com/job-detail/ai-reviewed",
+    )
+
+    first = service.prepare(job)
+    second = service.prepare(job)
+
+    assert first.eligible and first.prepared is not None
+    assert first.prepared.tailored
+    assert first.prepared.path != source
+    assert second.eligible and second.prepared is not None
+    assert second.prepared.path == first.prepared.path
+    assert planner.calls == 1
+    assert len(reviews) == 1
+    assert reviews[0][2] == hashlib.sha256(first.prepared.path.read_bytes()).hexdigest()
+    approval = first.prepared.path.with_suffix(f"{first.prepared.path.suffix}.approval.json")
+    assert approval.exists()
+    artifact_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (approval, first.prepared.path.with_suffix(".docx.manifest.json"))
+    )
+    assert "sk-test-secret-not-real" not in artifact_text
+
+
+def test_ai_bullets_review_rejection_skips_upload_candidate(tmp_path: Path) -> None:
+    source = make_ai_resume(tmp_path / "base.docx")
+    service = ResumeService.from_settings(
+        {
+            "resume_mode": "ai_bullets",
+            "ai_resume_path": str(source),
+            "ai_resume_output_dir": str(tmp_path / "ai-out"),
+            "minimum_match_score": 20,
+        },
+        bullet_planner=AIBulletPlanner(),
+        layout_verifier=lambda source_path, output_path: None,
+        review_callback=lambda job, path, digest: False,
+    )
+
+    result = service.prepare(
+        JobPosting(
+            title="AWS Data Engineer",
+            description="Required: AWS, Python, and SQL data pipeline experience.",
+            url="https://www.dice.com/job-detail/ai-rejected",
+        )
+    )
+
+    assert not result.eligible
+    assert result.prepared is None
+    assert "not approved" in result.reason
+    assert not list((tmp_path / "ai-out").glob("*.approval.json"))
+
+
+def test_ai_bullets_cannot_prepare_without_review_callback(tmp_path: Path) -> None:
+    source = make_ai_resume(tmp_path / "base.docx")
+    service = ResumeService.from_settings(
+        {
+            "resume_mode": "ai_bullets",
+            "ai_resume_path": str(source),
+            "ai_resume_output_dir": str(tmp_path / "ai-out"),
+            "minimum_match_score": 20,
+        },
+        bullet_planner=AIBulletPlanner(),
+        layout_verifier=lambda source_path, output_path: None,
+    )
+
+    result = service.prepare(
+        JobPosting(
+            title="AWS Data Engineer",
+            description="Required: AWS, Python, and SQL data pipeline experience.",
+            url="https://www.dice.com/job-detail/ai-review-required",
+        )
+    )
+
+    assert not result.eligible
+    assert result.prepared is None
+    assert "requires explicit review approval" in result.reason
+
+
+def test_ai_bullets_preview_evaluation_needs_no_key_or_planner_call(tmp_path: Path) -> None:
+    source = make_ai_resume(tmp_path / "base.docx")
+    service = ResumeService.from_settings(
+        {
+            "resume_mode": "ai_bullets",
+            "ai_resume_path": str(source),
+            "minimum_match_score": 20,
+        },
+        bullet_planner=ExplodingAIBulletPlanner(),
+    )
+
+    result = service.evaluate(
+        JobPosting(
+            title="AWS Data Engineer",
+            description="Required: AWS, Python, and SQL data pipeline experience.",
+            url="https://www.dice.com/job-detail/ai-preview",
+        )
+    )
+
+    assert result.eligible
+    assert result.prepared is None
+    assert result.decision is not None
+    assert result.decision.selected_profile.value == "custom"
+
+
+def test_ai_bullets_rejects_file_changed_during_review(tmp_path: Path) -> None:
+    source = make_ai_resume(tmp_path / "base.docx")
+
+    def mutate_during_review(job: JobPosting, path: Path, digest: str) -> bool:
+        document = Document(path)
+        document.paragraphs[0].text = "Changed while the review dialog was open"
+        document.save(path)
+        return True
+
+    service = ResumeService.from_settings(
+        {
+            "resume_mode": "ai_bullets",
+            "ai_resume_path": str(source),
+            "ai_resume_output_dir": str(tmp_path / "ai-out"),
+            "minimum_match_score": 20,
+        },
+        bullet_planner=AIBulletPlanner(),
+        layout_verifier=lambda source_path, output_path: None,
+        review_callback=mutate_during_review,
+    )
+
+    result = service.prepare(
+        JobPosting(
+            title="AWS Data Engineer",
+            description="Required: AWS, Python, and SQL data pipeline experience.",
+            url="https://www.dice.com/job-detail/ai-review-mutation",
+        )
+    )
+
+    assert not result.eligible
+    assert "changed during review" in result.reason
+    assert not list((tmp_path / "ai-out").glob("*.approval.json"))
+
+
+def test_ai_bullets_pre_upload_guard_rejects_post_approval_change(tmp_path: Path) -> None:
+    source = make_ai_resume(tmp_path / "base.docx")
+    service = ResumeService.from_settings(
+        {
+            "resume_mode": "ai_bullets",
+            "ai_resume_path": str(source),
+            "ai_resume_output_dir": str(tmp_path / "ai-out"),
+            "minimum_match_score": 20,
+        },
+        bullet_planner=AIBulletPlanner(),
+        layout_verifier=lambda source_path, output_path: None,
+        review_callback=lambda job, path, digest: True,
+    )
+    job = JobPosting(
+        title="AWS Data Engineer",
+        description="Required: AWS, Python, and SQL data pipeline experience.",
+        url="https://www.dice.com/job-detail/ai-post-approval-mutation",
+    )
+    result = service.prepare(job)
+    assert result.prepared is not None
+    expected_digest = service.assert_prepared_resume_approved(job, result.prepared)
+    assert expected_digest == hashlib.sha256(result.prepared.path.read_bytes()).hexdigest()
+
+    tampered = Document(result.prepared.path)
+    tampered.paragraphs[0].text = "Changed after approval"
+    tampered.save(result.prepared.path)
+
+    with pytest.raises(ResumeTailoringError, match="changed after validation"):
+        service.assert_prepared_resume_approved(job, result.prepared)

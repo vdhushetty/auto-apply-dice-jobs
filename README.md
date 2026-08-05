@@ -1,7 +1,7 @@
 # Dice Resume-Aware Apply Bot
 
 This repository contains an early-stage Python desktop application that searches Dice,
-filters jobs, chooses the most relevant AWS/Azure/GCP resume, and supports Dice Easy Apply.
+filters jobs, chooses or safely tailors a resume, and supports Dice Easy Apply.
 It is a maintained prototype, not a production service or a supported Dice integration.
 
 The default run mode is **preview**. It reads job details and reports fit decisions without
@@ -21,9 +21,18 @@ navigation and retrieval, inaccurate resume content, and keyword stuffing. See t
   every returned ID is an exact permutation of candidate-authored skill items, and create a
   job-specific DOCX. The model cannot add, delete, rename, or rewrite skills or claims. The
   generated file must render to the same page count as its source or it is deleted and skipped.
+- **AI bullet tailoring (`ai_bullets`):** score one user-provided base DOCX against the title and
+  full job description, then ask OpenAI for a bounded, evidence-grounded rewrite of up to four
+  existing experience bullets. At most two net-new bullets may be produced by splitting supported
+  source material. Local validation rejects technologies or quantified claims absent from the
+  cited same-role bullets and locks every non-target paragraph and structural feature. The prompt
+  and exact-file human review additionally prohibit invented experience, employers, dates,
+  education, or other candidate facts. The generated DOCX must keep the source page count and is
+  opened for explicit approval before it can be uploaded.
 
-Both modes require exactly three user-approved files labelled AWS, Azure, and GCP. No personal
-resume files are included in the repository.
+Static and tailored modes require exactly three user-approved files labelled AWS, Azure, and GCP.
+AI bullet tailoring uses one user-approved DOCX. No personal resume files are included in the
+repository.
 
 ## Current safety behavior
 
@@ -32,6 +41,7 @@ The application skips instead of submitting when any of these checks fail:
 - the job description cannot be read;
 - the best resume score is below the configured threshold;
 - tailored output is refused, malformed, unchanged, or structurally unsafe;
+- AI bullet output lacks candidate evidence, changes protected content/layout, or is not approved;
 - the posting leaves Dice instead of entering Dice Easy Apply;
 - the intended filename cannot be verified in a file input; or
 - Dice does not visibly confirm submission.
@@ -41,7 +51,8 @@ and API keys are not written to application logs.
 
 Three side-effect levels are available:
 
-- **Preview:** inspect, score, and classify Easy Apply jobs; never click Apply.
+- **Preview:** sample search queries round-robin, score full descriptions, inspect the highest-fit
+  eligible jobs up to the configured limit, and never click Apply.
 - **Verify upload:** one-job maximum; select and verify the exact resume file, then stop before
   Next or Submit. Dice may retain a draft.
 - **Submit:** upload and submit only after all fit, upload, form, and confirmation checks pass.
@@ -53,7 +64,7 @@ Three side-effect levels are available:
 - Brave or Google Chrome; browser launching currently uses ChromeDriver
 - LibreOffice/`soffice` for tailored-mode rendered page-count verification
 - A Dice account and prior written authorization from Dice for automated access
-- An OpenAI API key only for tailored mode
+- An OpenAI API key for generated resume modes; Preview does not need or call OpenAI
 
 ## Setup
 
@@ -75,12 +86,13 @@ DICE_AUTOMATION_AUTHORIZED=false
 WEB_BROWSER_PATH=
 LIBREOFFICE_PATH=
 OPENAI_API_KEY=
-OPENAI_MODEL=gpt-5.5-2026-04-23
+OPENAI_MODEL=gpt-5.6-sol
 ```
 
-`OPENAI_API_KEY` is unnecessary in static mode. The default is a pinned GPT-5.5 snapshot because
-GPT-5.6 was still unavailable to this project's API account during initialization. Change
-`OPENAI_MODEL` only after running the evaluation set.
+`OPENAI_API_KEY` is unnecessary in static mode and in Preview. AI bullet tailoring defaults to
+`gpt-5.6-sol` with low reasoning; `OPENAI_MODEL` intentionally overrides the non-secret model
+setting for accounts that need a different supported model. Change it only after running the
+evaluation set.
 
 ## Run locally
 
@@ -92,14 +104,17 @@ In **Settings**:
 
 1. Enter and test Dice credentials.
 2. Leave the run mode on `preview` for the first run.
-3. Choose `static` or `tailored`.
-4. Select and validate one AWS, Azure, and GCP resume.
+3. Choose `static`, `tailored`, or `ai_bullets` (AI bullet tailoring).
+4. Select and validate either one AWS/Azure/GCP set or one base DOCX. For AI bullet tailoring,
+   enter an API key; selecting the save checkbox writes it only to the ignored `.env` with local
+   file permissions, never to settings JSON.
 5. Choose the minimum match score, winner margin, and a small job limit.
 6. Save settings. Personal paths are written atomically to ignored
    `config/settings.local.json` with local-only permissions.
 7. Start the bot and review the mode-specific confirmation.
 
-Generated tailored files are kept under ignored `.data/tailored_resumes/`. Consolidated,
+Generated skill-order files are kept under ignored `.data/tailored_resumes/`; AI bullet files and
+hash-bound review approvals are kept under ignored `.data/ai_resumes/`. Consolidated,
 run-scoped Excel and JSON reports are written under ignored `.data/runs/`.
 
 ## Development and validation
@@ -159,6 +174,10 @@ Architecture, development, and risk details live in:
   repository initialization or sample validation.
 - Tailored mode safely reorders existing skill items; it intentionally does not rewrite prose,
   employment history, dates, metrics, education, or certifications.
+- AI bullet tailoring can rephrase or split only experience bullets backed by existing resume
+  facts. Its prompt forbids manufacturing experience, technologies, numbers, employers, dates,
+  education, or certifications; deterministic evidence checks and mandatory exact-file human
+  review fail closed before upload.
 - Tailored mode requires parseable delimiter-based skill lists in DOCX files. Complex text boxes,
   content controls, tracked changes, or scanned documents are not supported.
 - The matcher uses a version-controlled technology taxonomy and a lexical signal. The eval set is

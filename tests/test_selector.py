@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from core.resumes.models import CloudProfile, JobPosting, ResumeVariant
+from core.resumes.models import CloudProfile, CustomProfile, JobPosting, ResumeVariant
 from core.resumes.selector import (
     ResumeSelector,
+    SingleResumeSelector,
     detect_manual_review_reasons,
     extract_lexical_tokens,
     extract_required_technology_terms,
@@ -318,8 +319,52 @@ def test_explicit_single_cloud_in_title_routes_that_profile() -> None:
     assert decision.variant_scores["azure"] > decision.variant_scores["aws"]
     assert decision.selected_profile is CloudProfile.AWS
     assert decision.explicit_title_profile is CloudProfile.AWS
-    assert not decision.ambiguous
+
+
+def test_single_resume_selector_reports_custom_profile() -> None:
+    custom = ResumeVariant(
+        profile=CustomProfile.CUSTOM,
+        path=Path("/base.docx"),
+        text="AWS data engineer Python SQL Glue S3",
+        terms=extract_technology_terms("AWS data engineer Python SQL Glue S3"),
+        lexical_tokens=extract_lexical_tokens("AWS data engineer Python SQL Glue S3"),
+    )
+
+    decision = SingleResumeSelector(custom, threshold=20).select(
+        JobPosting(
+            title="AWS Data Engineer",
+            description="Required: AWS Glue, S3, Python, and SQL.",
+            url="https://www.dice.com/job-detail/custom",
+        )
+    )
+
     assert decision.eligible
+    assert decision.selected_profile is CustomProfile.CUSTOM
+    assert decision.variant_scores == {"custom": decision.score}
+    assert "Custom base resume" in decision.reason
+    assert not decision.ambiguous
+
+
+def test_single_resume_selector_fails_closed_on_missing_required_term() -> None:
+    custom = ResumeVariant(
+        profile=CustomProfile.CUSTOM,
+        path=Path("/base.docx"),
+        text="Data engineer Python SQL",
+        terms=extract_technology_terms("Data engineer Python SQL"),
+        lexical_tokens=extract_lexical_tokens("Data engineer Python SQL"),
+    )
+
+    decision = SingleResumeSelector(custom, threshold=0).select(
+        JobPosting(
+            title="GCP Data Engineer",
+            description="Requirements:\n- GCP\n- BigQuery\n- Python\n- SQL",
+            url="https://www.dice.com/job-detail/custom-missing",
+        )
+    )
+
+    assert not decision.eligible
+    assert {"gcp", "gcp-bigquery"} <= set(decision.missing_required_terms)
+    assert not decision.ambiguous
 
 
 @pytest.mark.parametrize("margin", [-1, 101])

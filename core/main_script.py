@@ -4,6 +4,7 @@ import re
 import time
 from dataclasses import dataclass
 from enum import StrEnum
+from math import isfinite
 from typing import Any, Callable, Mapping
 from urllib.parse import quote, urlparse
 
@@ -18,76 +19,80 @@ from selenium.webdriver.support.ui import WebDriverWait
 from core.authorization import require_dice_automation_authorized
 from core.browser_detector import get_browser_path
 from core.resumes import JobPosting, ResumeService
+from core.resumes.models import ResumeTailoringError
 
 
 # Load environment variables
 load_dotenv()
 
+
 def get_web_driver(headless=False, retry_with_alternative=True):
     """
     Initializes a Selenium WebDriver with fallback options.
     If the primary browser (Brave) fails to load, it will try Chrome as a fallback.
-    
+
     Parameters:
         headless (bool): Whether to use headless mode
         retry_with_alternative (bool): Whether to try alternative browsers if primary fails
-        
+
     Returns:
         WebDriver: Initialized WebDriver instance
     """
     # Get browser path from .env or detect it
     web_browser_path = get_browser_path()
-    
+
     if not web_browser_path:
         raise Exception("Browser path not found in .env file. Please set WEB_BROWSER_PATH.")
 
     tried_browsers = []
-    
+    tried_browser_paths = set()
+
     # Try the primary browser first
     try:
         options = Options()
         options.binary_location = web_browser_path
-        
+
         # Add headless mode options if requested
         if headless:
-            options.add_argument("--headless")
-            
+            options.add_argument("--headless=new")
+
         options.add_argument("--disable-gpu")
         options.add_argument("--window-size=1920,1080")
         options.add_argument("--disable-popup-blocking")
         options.add_argument("--disable-features=EnableEphemeralFlashPermission")
         options.add_argument("--disable-infobars")
         options.add_argument("--disable-notifications")
-        
+
         # Clear browser cache and cookies
         options.add_argument("--disable-application-cache")
         options.add_argument("--incognito")
 
         driver = webdriver.Chrome(options=options)
-        
+
         # Test local navigation without making an unrelated external request.
         driver.get("data:text/html,<body>ready</body>")
         driver.find_element(By.TAG_NAME, "body")  # Should work if page loaded
-        
+
         print(f"Successfully initialized browser: {os.path.basename(web_browser_path)}")
         return driver
-        
+
     except Exception as e:
         tried_browsers.append(os.path.basename(web_browser_path))
+        tried_browser_paths.add(os.path.realpath(web_browser_path))
         print(f"Error initializing primary browser ({os.path.basename(web_browser_path)}): {e}")
-        
+
         if not retry_with_alternative:
             raise Exception(f"Failed to initialize browser and retry is disabled.")
-    
+
     # If we get here, the primary browser failed - let's try alternatives
     system = platform.system()
     alternative_paths = []
-    
+
     if system == "Darwin":  # macOS
         alternative_paths = [
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Firefox.app/Contents/MacOS/firefox",
-            "/Applications/Safari.app/Contents/MacOS/Safari"
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
         ]
     elif system == "Windows":
         program_files = os.environ.get("ProgramFiles", "C:\\Program Files")
@@ -95,54 +100,61 @@ def get_web_driver(headless=False, retry_with_alternative=True):
         alternative_paths = [
             f"{program_files}\\Google\\Chrome\\Application\\chrome.exe",
             f"{program_files_x86}\\Google\\Chrome\\Application\\chrome.exe",
-            f"{program_files}\\Mozilla Firefox\\firefox.exe",
-            f"{program_files_x86}\\Mozilla Firefox\\firefox.exe"
+            f"{program_files}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+            f"{program_files_x86}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+            f"{program_files}\\Microsoft\\Edge\\Application\\msedge.exe",
+            f"{program_files_x86}\\Microsoft\\Edge\\Application\\msedge.exe",
         ]
     else:  # Linux
         alternative_paths = [
             "/usr/bin/google-chrome",
             "/usr/bin/google-chrome-stable",
-            "/usr/bin/firefox"
+            "/usr/bin/brave-browser",
+            "/usr/bin/microsoft-edge",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
         ]
-    
+
     # Try each alternative browser
     for alt_path in alternative_paths:
-        if alt_path not in tried_browsers and os.path.exists(alt_path):
+        normalized_path = os.path.realpath(alt_path)
+        if normalized_path not in tried_browser_paths and os.path.exists(alt_path):
             try:
                 options = Options()
                 options.binary_location = alt_path
-                
+
                 if headless:
-                    options.add_argument("--headless")
-                    
+                    options.add_argument("--headless=new")
+
                 options.add_argument("--disable-gpu")
                 options.add_argument("--window-size=1920,1080")
                 options.add_argument("--incognito")  # Use incognito to avoid cache issues
-                
+
                 driver = webdriver.Chrome(options=options)
-                
+
                 # Test local navigation without making an unrelated external request.
                 driver.get("data:text/html,<body>ready</body>")
                 driver.find_element(By.TAG_NAME, "body")
-                
+
                 print(f"Successfully initialized alternative browser: {os.path.basename(alt_path)}")
-                
+
                 # Update the .env file with working browser
                 from dotenv import set_key, find_dotenv
+
                 dotenv_path = find_dotenv()
                 if dotenv_path:
                     set_key(dotenv_path, "WEB_BROWSER_PATH", alt_path)
                     print(f"Updated WEB_BROWSER_PATH in .env file to: {alt_path}")
-                
+
                 return driver
-                
+
             except Exception as e:
                 tried_browsers.append(os.path.basename(alt_path))
+                tried_browser_paths.add(normalized_path)
                 print(f"Error initializing alternative browser ({os.path.basename(alt_path)}): {e}")
-    
+
     # If we get here, all browsers failed
     raise Exception(f"Failed to initialize any browser. Tried: {', '.join(tried_browsers)}")
-
 
 
 class ApplicationStatus(StrEnum):
@@ -169,6 +181,20 @@ class ApplicationResult:
     resume_profile: str = ""
     match_score: float | None = None
     resume_filename: str = ""
+
+
+@dataclass(frozen=True)
+class JobSelection:
+    """Result of the read-only, full-description candidate ranking pass."""
+
+    selected_jobs: tuple[dict[str, Any], ...]
+    deferred_jobs: tuple[dict[str, Any], ...]
+    rejected_jobs: tuple[dict[str, Any], ...]
+    assessed_count: int
+    cancelled: bool = False
+
+
+CANDIDATE_POOL_MULTIPLIER = 4
 
 
 def _visible(elements):
@@ -236,13 +262,20 @@ def _browser_filename(value: str) -> str:
     return value.replace("\\", "/").rsplit("/", 1)[-1].strip().lower()
 
 
-def _upload_resume_if_present(driver, resume_path: str) -> tuple[bool, bool]:
+def _upload_resume_if_present(
+    driver,
+    resume_path: str,
+    *,
+    pre_upload: Callable[[], None] | None = None,
+) -> tuple[bool, bool]:
     inputs = driver.find_elements(By.CSS_SELECTOR, 'input[type="file"]')
     if not inputs:
         return False, False
     filename = os.path.basename(resume_path).lower()
     for file_input in inputs:
         try:
+            if pre_upload is not None:
+                pre_upload()
             file_input.send_keys(resume_path)
 
             def intended_file_selected(current_driver):
@@ -257,7 +290,11 @@ def _upload_resume_if_present(driver, resume_path: str) -> tuple[bool, bool]:
                 return _browser_filename(value) == filename
 
             WebDriverWait(driver, 12, poll_frequency=0.25).until(intended_file_selected)
+            if pre_upload is not None:
+                pre_upload()
             return True, True
+        except ResumeTailoringError:
+            raise
         except Exception:
             continue
     return True, False
@@ -353,6 +390,233 @@ def _record_resume_metadata(job: Mapping[str, Any], result: ApplicationResult) -
         job["Resume Match Score"] = result.match_score
     if result.resume_filename:
         job["Resume Filename"] = result.resume_filename
+
+
+def build_diverse_candidate_pool(
+    job_buckets: list[list[dict[str, Any]]],
+    *,
+    application_limit: int,
+    pool_multiplier: int = CANDIDATE_POOL_MULTIPLIER,
+) -> list[dict[str, Any]]:
+    """Build a stable, bounded round-robin pool from search-query result buckets."""
+
+    if application_limit < 1:
+        raise ValueError("Application limit must be at least 1.")
+    if pool_multiplier < 1:
+        raise ValueError("Candidate pool multiplier must be at least 1.")
+
+    nonempty_buckets = [bucket for bucket in job_buckets if bucket]
+    pool_limit = max(application_limit * pool_multiplier, len(nonempty_buckets))
+    selected: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    bucket_offsets = [0] * len(nonempty_buckets)
+
+    while len(selected) < pool_limit:
+        added_this_round = False
+        for bucket_index, bucket in enumerate(nonempty_buckets):
+            while bucket_offsets[bucket_index] < len(bucket):
+                job = bucket[bucket_offsets[bucket_index]]
+                bucket_offsets[bucket_index] += 1
+                job_url = str(job.get("Job URL", ""))
+                if job_url in seen_urls:
+                    continue
+                seen_urls.add(job_url)
+                selected.append(job)
+                added_this_round = True
+                break
+            if len(selected) >= pool_limit:
+                break
+        if not added_this_round:
+            break
+
+    return selected
+
+
+def candidate_bucket_limits(
+    bucket_count: int,
+    *,
+    application_limit: int,
+    pool_multiplier: int = CANDIDATE_POOL_MULTIPLIER,
+) -> tuple[int, ...]:
+    """Distribute the bounded ranking budget evenly across search queries."""
+
+    if bucket_count < 1:
+        return ()
+    if application_limit < 1:
+        raise ValueError("Application limit must be at least 1.")
+    if pool_multiplier < 1:
+        raise ValueError("Candidate pool multiplier must be at least 1.")
+    pool_limit = max(application_limit * pool_multiplier, bucket_count)
+    base_size, extra = divmod(pool_limit, bucket_count)
+    return tuple(base_size + (1 if index < extra else 0) for index in range(bucket_count))
+
+
+def _bounded_page_count(
+    total_jobs: int,
+    observed_page_size: int,
+    *,
+    max_pages: int | None,
+) -> int:
+    page_size = observed_page_size or 20
+    page_count = max(1, (total_jobs + page_size - 1) // page_size)
+    page_count = min(11, page_count)
+    return min(page_count, max_pages) if max_pages is not None else page_count
+
+
+def rank_eligible_jobs(
+    driver,
+    jobs: list[dict[str, Any]],
+    resume_service: ResumeService,
+    *,
+    limit: int,
+    cancel_requested: Callable[[], bool] | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> JobSelection:
+    """Rank resume-eligible Dice jobs by full-description match before applying a cap.
+
+    This preflight pass only navigates to job-detail pages and calls the service's
+    side-effect-free ``evaluate`` method. It never inspects or clicks Apply controls and it
+    never prepares a tailored resume. Jobs that cannot be assessed confidently are rejected.
+    Equal scores retain discovery order for deterministic behavior.
+    """
+
+    require_dice_automation_authorized()
+    if limit < 1:
+        raise ValueError("Job selection limit must be at least 1.")
+    evaluator = getattr(resume_service, "evaluate", None)
+    if not callable(evaluator):
+        raise RuntimeError("Candidate ranking requires a side-effect-free resume evaluator.")
+
+    original_url = driver.current_url
+    ranked: list[tuple[float, int, dict[str, Any]]] = []
+    rejected: list[dict[str, Any]] = []
+    assessed_count = 0
+    cancelled = False
+
+    def reject(job: dict[str, Any], reason: str) -> None:
+        job["Selection Status"] = "ineligible"
+        job["Application Status"] = ApplicationStatus.SKIPPED.value
+        job["Application Reason"] = reason
+        rejected.append(job)
+
+    try:
+        total_jobs = len(jobs)
+        for discovery_index, job in enumerate(jobs):
+            if _cancellation_requested(cancel_requested):
+                cancelled = True
+                break
+
+            job_title = str(job.get("Job Title", "")).strip()
+            if progress_callback is not None:
+                progress_callback(discovery_index + 1, total_jobs, job_title or "Unknown")
+
+            job_url = str(job.get("Job URL", ""))
+            job_id = str(job.get("Job ID", "")).strip()
+            if not _is_dice_url(job_url, job_detail=True):
+                reject(job, "Only HTTPS Dice job-detail URLs are accepted for ranking.")
+                assessed_count += 1
+                continue
+
+            try:
+                driver.get(job_url)
+                description = _extract_job_description(driver)
+            except Exception:
+                reject(job, "Dice job details could not be opened for safe ranking.")
+                assessed_count += 1
+                continue
+            if not description:
+                reject(
+                    job,
+                    "Dice job description could not be read; skipped to avoid a random application.",
+                )
+                assessed_count += 1
+                continue
+
+            try:
+                posting = JobPosting(
+                    title=job_title,
+                    description=description,
+                    url=job_url,
+                    job_id=job_id,
+                )
+                evaluation = evaluator(posting)
+            except Exception as exc:
+                reject(
+                    job,
+                    f"Resume evaluation failed safely: {type(exc).__name__}.",
+                )
+                assessed_count += 1
+                continue
+
+            assessed_count += 1
+            _record_decision_metadata(job, evaluation)
+            decision = getattr(evaluation, "decision", None)
+            manual_review_reasons = tuple(getattr(decision, "manual_review_reasons", ()) or ())
+            if (
+                not getattr(evaluation, "eligible", False)
+                or decision is None
+                or not getattr(decision, "eligible", False)
+                or manual_review_reasons
+            ):
+                reject(
+                    job,
+                    getattr(
+                        evaluation,
+                        "reason",
+                        "Resume evaluation did not approve this job.",
+                    ),
+                )
+                continue
+
+            raw_score = getattr(decision, "score", None)
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError):
+                reject(job, "Resume evaluation returned an invalid match score.")
+                continue
+            if isinstance(raw_score, bool) or not isfinite(score):
+                reject(job, "Resume evaluation returned an invalid match score.")
+                continue
+
+            profile, _ = _decision_metadata(evaluation)
+            job["Resume Profile"] = profile
+            job["Resume Match Score"] = score
+            ranked.append((score, discovery_index, job))
+    finally:
+        if original_url:
+            try:
+                driver.get(original_url)
+            except Exception:
+                pass
+
+    if cancelled:
+        return JobSelection(
+            selected_jobs=(),
+            deferred_jobs=tuple(item[2] for item in ranked),
+            rejected_jobs=tuple(rejected),
+            assessed_count=assessed_count,
+            cancelled=True,
+        )
+
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    for rank, (_, _, job) in enumerate(ranked, start=1):
+        job["Candidate Rank"] = rank
+    selected = tuple(item[2] for item in ranked[:limit])
+    deferred = tuple(item[2] for item in ranked[limit:])
+    for job in selected:
+        job["Selection Status"] = "selected"
+    for job in deferred:
+        job["Selection Status"] = "eligible_outside_job_limit"
+        job["Selection Reason"] = (
+            f"Resume-eligible but outside the top {limit} jobs by match score."
+        )
+
+    return JobSelection(
+        selected_jobs=selected,
+        deferred_jobs=deferred,
+        rejected_jobs=tuple(rejected),
+        assessed_count=assessed_count,
+    )
 
 
 def apply_to_job_url(
@@ -484,9 +748,10 @@ def apply_to_job_url(
             else:
                 preparation = resume_service.prepare(posting)
         profile, score = _decision_metadata(preparation)
-        if not getattr(preparation, "eligible", False) or getattr(
-            preparation, "prepared", None
-        ) is None:
+        if (
+            not getattr(preparation, "eligible", False)
+            or getattr(preparation, "prepared", None) is None
+        ):
             result = ApplicationResult(
                 ApplicationStatus.SKIPPED,
                 getattr(preparation, "reason", "Resume preparation did not approve this job."),
@@ -497,6 +762,11 @@ def apply_to_job_url(
         prepared_path = preparation.prepared.path.resolve()
         if isinstance(job, dict):
             job["Tailored Resume"] = bool(preparation.prepared.tailored)
+
+        def assert_prepared_resume_approved() -> None:
+            guard = getattr(resume_service, "assert_prepared_resume_approved", None)
+            if callable(guard):
+                guard(posting, preparation.prepared)
 
         if _cancellation_requested(cancel_requested):
             result = ApplicationResult(
@@ -510,6 +780,16 @@ def apply_to_job_url(
             "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});",
             apply_control,
         )
+        try:
+            assert_prepared_resume_approved()
+        except ResumeTailoringError as exc:
+            result = ApplicationResult(
+                ApplicationStatus.SKIPPED,
+                str(exc),
+                resume_profile=profile,
+                match_score=score,
+            )
+            return result
         try:
             apply_control.click()
         except Exception:
@@ -545,9 +825,20 @@ def apply_to_job_url(
                         match_score=score,
                     )
                     return result
-                found_input, upload_succeeded = _upload_resume_if_present(
-                    driver, str(prepared_path)
-                )
+                try:
+                    found_input, upload_succeeded = _upload_resume_if_present(
+                        driver,
+                        str(prepared_path),
+                        pre_upload=assert_prepared_resume_approved,
+                    )
+                except ResumeTailoringError as exc:
+                    result = ApplicationResult(
+                        ApplicationStatus.SKIPPED,
+                        str(exc),
+                        resume_profile=profile,
+                        match_score=score,
+                    )
+                    return result
                 if found_input and not upload_succeeded:
                     result = ApplicationResult(
                         ApplicationStatus.FAILED,
@@ -615,13 +906,22 @@ def apply_to_job_url(
                     "arguments[0].scrollIntoView({block: 'center'});", submit_button
                 )
                 try:
+                    assert_prepared_resume_approved()
+                except ResumeTailoringError as exc:
+                    result = ApplicationResult(
+                        ApplicationStatus.SKIPPED,
+                        str(exc),
+                        resume_profile=profile,
+                        match_score=score,
+                        resume_filename=prepared_path.name,
+                    )
+                    return result
+                try:
                     submit_button.click()
                 except Exception:
                     driver.execute_script("arguments[0].click();", submit_button)
                 try:
-                    WebDriverWait(driver, 30, poll_frequency=0.4).until(
-                        _confirmation_present
-                    )
+                    WebDriverWait(driver, 30, poll_frequency=0.4).until(_confirmation_present)
                 except Exception:
                     result = ApplicationResult(
                         ApplicationStatus.FAILED,
@@ -661,6 +961,17 @@ def apply_to_job_url(
                     )
                     return result
                 try:
+                    assert_prepared_resume_approved()
+                except ResumeTailoringError as exc:
+                    result = ApplicationResult(
+                        ApplicationStatus.SKIPPED,
+                        str(exc),
+                        resume_profile=profile,
+                        match_score=score,
+                        resume_filename=prepared_path.name if resume_uploaded else "",
+                    )
+                    return result
+                try:
                     next_button.click()
                 except Exception:
                     driver.execute_script("arguments[0].click();", next_button)
@@ -690,27 +1001,41 @@ def apply_to_job_url(
             except Exception:
                 pass
 
-def fetch_jobs_with_requests(driver, search_query, include_keywords=None, exclude_keywords=None):
+
+def fetch_jobs_with_requests(
+    driver,
+    search_query,
+    include_keywords=None,
+    exclude_keywords=None,
+    *,
+    max_pages=None,
+    max_included_jobs=None,
+):
     """
     Use the existing browser instance to fetch job listings.
     """
     require_dice_automation_authorized()
+    if max_pages is not None and max_pages < 1:
+        raise ValueError("max_pages must be at least 1 when provided.")
+    if max_included_jobs is not None and max_included_jobs < 1:
+        raise ValueError("max_included_jobs must be at least 1 when provided.")
     print(f"Fetching jobs for query: {search_query}")
-    
+
     # Format search parameters for URL
     encoded_query = quote(search_query)
-    
+
     # Updated URL structure
     base_url = f"https://www.dice.com/jobs?filters.employmentType=CONTRACTS&filters.postedDate=ONE&q={encoded_query}"
-    
+
     included_jobs = []
     excluded_jobs = []
     total_jobs_found = 0
-    
+
     # Create WebDriverWait objects with different timeout values
     short_wait = WebDriverWait(driver, 20)
-    medium_wait = WebDriverWait(driver, 60)  # Increased timeout for slow loading
-    
+    medium_wait = WebDriverWait(driver, 30)
+    card_wait = WebDriverWait(driver, 10)
+
     try:
         # First load the initial page
         max_retries = 3
@@ -722,115 +1047,144 @@ def fetch_jobs_with_requests(driver, search_query, include_keywords=None, exclud
                 break
             except Exception as e:
                 if attempt < max_retries - 1:
-                    print(f"Error loading initial page. Retry {attempt+1}/{max_retries}...")
+                    print(f"Error loading initial page. Retry {attempt + 1}/{max_retries}...")
                 else:
                     print(f"Failed to load initial page after {max_retries} attempts.")
                     raise e
-        
+
         # Get total jobs count
         total_pages = 1
         try:
             print("Looking for job count element...")
-            
+
             # Wait for the job count element with flexibility in the class name
             job_count_element = medium_wait.until(
-                EC.presence_of_element_located((By.XPATH, "//p[contains(@class, 'text-neutral-900') and contains(text(), 'results')]"))
+                EC.presence_of_element_located(
+                    (
+                        By.XPATH,
+                        "//p[contains(@class, 'text-neutral-900') and contains(text(), 'results')]",
+                    )
+                )
             )
-            
+
             total_jobs_text = job_count_element.text
             print(f"Found job count text: '{total_jobs_text}'")
-            
-            total_jobs_match = re.search(r'(\d+)\s+results', total_jobs_text)
-            
+
+            total_jobs_match = re.search(r"(\d+)\s+results", total_jobs_text)
+
             if total_jobs_match:
                 total_jobs = int(total_jobs_match.group(1))
                 print(f"Total jobs for query '{search_query}': {total_jobs}")
-                
-                # 20 jobs per page
-                jobs_per_page = 20
-                total_pages = min(11, (total_jobs + jobs_per_page - 1) // jobs_per_page)
+
+                # Dice's page size changes over time. Derive it from the first page instead
+                # of assuming 20, which otherwise causes requests for empty trailing pages.
+                try:
+                    card_wait.until(
+                        EC.presence_of_element_located(
+                            (By.CSS_SELECTOR, "div[data-id][data-job-guid]")
+                        )
+                    )
+                except Exception:
+                    pass
+                first_page_size = len(
+                    driver.find_elements(By.CSS_SELECTOR, "div[data-id][data-job-guid]")
+                )
+                jobs_per_page = first_page_size or 20
+                total_pages = _bounded_page_count(
+                    total_jobs,
+                    first_page_size,
+                    max_pages=max_pages,
+                )
                 print(f"Will process {total_pages} pages ({jobs_per_page} jobs per page)")
             else:
                 print(f"Could not extract job count from: {total_jobs_text}")
                 total_pages = 3  # Default to 3 pages
-            
+                if max_pages is not None:
+                    total_pages = min(total_pages, max_pages)
+
         except Exception as e:
             print(f"Could not find total job count, defaulting to 3 pages: {str(e)}")
             total_pages = 3
-        
+            if max_pages is not None:
+                total_pages = min(total_pages, max_pages)
+
         # Process each page
         for page in range(1, total_pages + 1):
             current_url = base_url if page == 1 else f"{base_url}&page={page}"
             print(f"Processing page {page}/{total_pages}: {current_url}")
-            
+
             if page > 1:  # Only need to navigate if not on first page
                 try:
                     driver.get(current_url)
                     short_wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
                 except Exception as e:
                     print(f"Error loading page {page}: {e}")
-                    continue
-            
+                    break
+
             # Wait for job cards to appear with a more specific selector based on example
             try:
                 print("Waiting for job cards to load...")
-                
+
                 # NEW APPROACH: Wait specifically for job cards using data attributes
-                medium_wait.until(
+                card_wait.until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-id][data-job-guid]"))
                 )
-                
+
                 # Add a small delay to ensure dynamic content is fully rendered
                 time.sleep(2)
-                
+
                 # Get all job cards using the data-id and data-job-guid attributes
                 job_cards = driver.find_elements(By.CSS_SELECTOR, "div[data-id][data-job-guid]")
-                
+
                 if not job_cards:
                     print(f"No job cards found on page {page}")
-                    continue
-                    
+                    break
+
                 print(f"Found {len(job_cards)} jobs on page {page}")
-                
+
                 # Process each job card
                 for card_index, card in enumerate(job_cards):
                     try:
                         # Get job ID and URL from data attributes
-                        job_id = card.get_attribute('data-id')
-                        job_guid = card.get_attribute('data-job-guid') 
+                        job_id = card.get_attribute("data-id")
+                        job_guid = card.get_attribute("data-job-guid")
                         if not job_guid:
                             print(f"Missing job_guid on card {card_index}")
                             continue
-                            
+
                         job_url = f"https://www.dice.com/job-detail/{job_guid}"
-                        
+
                         # Extract job title - using the exact classes from example
                         job_title_element = card.find_element(
-                            By.CSS_SELECTOR, 
-                            "a[data-testid='job-search-job-detail-link']"
+                            By.CSS_SELECTOR, "a[data-testid='job-search-job-detail-link']"
                         )
-                        job_title = job_title_element.text.strip() if job_title_element else "Unknown"
-                        
+                        job_title = (
+                            job_title_element.text.strip() if job_title_element else "Unknown"
+                        )
+
                         # Extract company name - using the exact structure from example
                         company_element = card.find_element(
-                            By.CSS_SELECTOR, 
-                            "a[href*='company-profile'] p"
+                            By.CSS_SELECTOR, "a[href*='company-profile'] p"
                         )
-                        company_name = company_element.text.strip() if company_element else "Unknown"
-                        
+                        company_name = (
+                            company_element.text.strip() if company_element else "Unknown"
+                        )
+
                         # Extract location - first text paragraph with the specified class
                         location_elements = card.find_elements(
-                            By.CSS_SELECTOR, 
-                            "p.text-sm.font-normal.text-zinc-600"
+                            By.CSS_SELECTOR, "p.text-sm.font-normal.text-zinc-600"
                         )
-                        job_location = location_elements[0].text.strip() if location_elements else "Unknown"
-                        
+                        job_location = (
+                            location_elements[0].text.strip() if location_elements else "Unknown"
+                        )
+
                         # Extract employment type from the box with specific ID
-                        job_employment_type = "Contract"  # Default since we're filtering for contracts
+                        job_employment_type = (
+                            "Contract"  # Default since we're filtering for contracts
+                        )
                         try:
                             emp_type_element = card.find_element(
-                                By.CSS_SELECTOR, 
-                                "p#employmentType-label"
+                                By.CSS_SELECTOR, "p#employmentType-label"
                             )
                             if emp_type_element:
                                 job_employment_type = emp_type_element.text.strip()
@@ -844,10 +1198,10 @@ def fetch_jobs_with_requests(driver, search_query, include_keywords=None, exclud
                                         break
                             except:
                                 pass
-                        
+
                         # Posted date is always "Today" since we filter for last 24 hours
                         job_posted_date = "Today"
-                        
+
                         # Create job entry
                         job_entry = {
                             "Job ID": job_id or job_guid,
@@ -857,51 +1211,71 @@ def fetch_jobs_with_requests(driver, search_query, include_keywords=None, exclud
                             "Location": job_location,
                             "Employment Type": job_employment_type,
                             "Posted Date": job_posted_date,
-                            "Applied": False
+                            "Applied": False,
                         }
-                        
+
                         # Apply filtering
                         include_job = True
                         exclusion_reason = ""
                         job_title_lower = job_title.lower()
-                        
+
                         # Check exclude keywords
-                        if exclude_keywords and any(keyword.lower() in job_title_lower for keyword in exclude_keywords):
-                            matching_keywords = [kw for kw in exclude_keywords if kw.lower() in job_title_lower]
-                            exclusion_reason = f"Contains excluded keywords: {', '.join(matching_keywords)}"
+                        if exclude_keywords and any(
+                            keyword.lower() in job_title_lower for keyword in exclude_keywords
+                        ):
+                            matching_keywords = [
+                                kw for kw in exclude_keywords if kw.lower() in job_title_lower
+                            ]
+                            exclusion_reason = (
+                                f"Contains excluded keywords: {', '.join(matching_keywords)}"
+                            )
                             include_job = False
-                        
+
                         # Check include keywords
-                        if include_keywords and not any(keyword.lower() in job_title_lower for keyword in include_keywords):
-                            exclusion_reason = f"Missing required keywords: {', '.join(include_keywords)}"
+                        if include_keywords and not any(
+                            keyword.lower() in job_title_lower for keyword in include_keywords
+                        ):
+                            exclusion_reason = (
+                                f"Missing required keywords: {', '.join(include_keywords)}"
+                            )
                             include_job = False
-                        
+
                         if include_job:
                             included_jobs.append(job_entry)
+                            if (
+                                max_included_jobs is not None
+                                and len(included_jobs) >= max_included_jobs
+                            ):
+                                break
                         else:
                             job_entry["Exclusion Reason"] = exclusion_reason
                             excluded_jobs.append(job_entry)
-                    
+
                     except Exception as e:
                         print(f"Error processing job card {card_index} on page {page}: {str(e)}")
                         continue
-                
+
                 total_jobs_found += len(job_cards)
-                
+                if max_included_jobs is not None and len(included_jobs) >= max_included_jobs:
+                    print(
+                        f"Reached candidate limit of {max_included_jobs} for query '{search_query}'"
+                    )
+                    break
+
             except Exception as e:
                 print(f"Error processing job cards on page {page}: {str(e)}")
-                
+                # Stop at the first unreadable/empty page instead of waiting on trailing pages.
+                break
+
     except Exception as e:
         print(f"Error during job fetching: {str(e)}")
-    
+
     print(f"Total jobs processed: {total_jobs_found}")
     print(f"Jobs included after filtering: {len(included_jobs)}")
     print(f"Jobs excluded after filtering: {len(excluded_jobs)}")
-    
+
     return included_jobs, excluded_jobs
 
-
-            
 
 def save_to_excel(job_data, filename="job_application_report.xlsx"):
     """
@@ -914,11 +1288,11 @@ def save_to_excel(job_data, filename="job_application_report.xlsx"):
     except Exception as e:
         print(f"Error saving to Excel: {e}")
 
+
 def main():
     """Keep the supported entry point explicit and avoid a second unsafe workflow."""
 
     raise SystemExit("Run the configured Tkinter application with: python run.py")
-
 
 
 if __name__ == "__main__":

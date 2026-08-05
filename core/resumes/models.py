@@ -25,6 +25,7 @@ class ResumeMode(StrEnum):
 
     STATIC = "static"
     TAILORED = "tailored"
+    AI_BULLETS = "ai_bullets"
 
     @classmethod
     def parse(cls, value: str) -> ResumeMode:
@@ -33,6 +34,8 @@ class ResumeMode(StrEnum):
             "static selection": cls.STATIC,
             "curated": cls.TAILORED,
             "tailored per job": cls.TAILORED,
+            "ai bullet tailoring": cls.AI_BULLETS,
+            "ai bullets": cls.AI_BULLETS,
         }
         if normalized in aliases:
             return aliases[normalized]
@@ -51,6 +54,12 @@ class CloudProfile(StrEnum):
     AWS = "aws"
     AZURE = "azure"
     GCP = "gcp"
+
+
+class CustomProfile(StrEnum):
+    """Profile label for the user-provided resume used by AI bullet mode."""
+
+    CUSTOM = "custom"
 
 
 @dataclass(frozen=True)
@@ -80,7 +89,7 @@ class JobPosting:
 class ResumeVariant:
     """A validated source resume and its extracted text."""
 
-    profile: CloudProfile
+    profile: CloudProfile | CustomProfile
     path: Path
     text: str
     terms: frozenset[str]
@@ -91,7 +100,7 @@ class ResumeVariant:
 class MatchDecision:
     """Transparent result of comparing one job with all variants."""
 
-    selected_profile: CloudProfile
+    selected_profile: CloudProfile | CustomProfile
     selected_path: Path
     score: float
     threshold: float
@@ -122,6 +131,8 @@ class MatchDecision:
             terms = ", ".join(self.missing_required_terms)
             return f"Selected resume is missing required job terms: {terms}."
         if self.eligible:
+            if self.selected_profile is CustomProfile.CUSTOM:
+                return f"Custom base resume matched at {self.score:.1f}%."
             return f"Selected {self.selected_profile.value.upper()} at {self.score:.1f}% match."
         selection_label = "Selected resume" if self.explicit_title_profile else "Best resume"
         return (

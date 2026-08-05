@@ -11,7 +11,30 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from .curator import PROMPT_VERSION, CurationPlanner, OpenAICurationPlanner, validate_curation_plan
+from .bullet_curator import (
+    BULLET_REWRITE_PROMPT_VERSION,
+    DEFAULT_BULLET_REWRITE_MODEL,
+    MAX_EDITED_BULLETS,
+    MAX_REPLACEMENT_BULLET_CHARS,
+    MAX_REPLACEMENTS_PER_EDIT,
+    MAX_SOURCE_BULLETS_PER_EDIT,
+    BulletRewritePlanner,
+    ValidatedBulletEdit,
+    ValidatedBulletRewritePlan,
+    validate_bullet_rewrite_plan,
+)
+from .bullet_documents import (
+    collect_editable_bullets,
+    create_bullet_rewritten_docx,
+    validate_bullet_rewritten_docx,
+)
+from .curator import (
+    PROMPT_VERSION,
+    CurationPlanner,
+    OpenAIBulletRewritePlanner,
+    OpenAICurationPlanner,
+    validate_curation_plan,
+)
 from .documents import (
     SkillSlot,
     collect_skill_slots,
@@ -23,6 +46,7 @@ from .documents import (
 from .layout import DocxLayoutVerifier
 from .models import (
     CloudProfile,
+    CustomProfile,
     JobPosting,
     MatchDecision,
     PreparedResume,
@@ -35,13 +59,16 @@ from .models import (
 from .selector import (
     DEFAULT_MINIMUM_WINNER_MARGIN,
     ResumeSelector,
+    SingleResumeSelector,
     extract_lexical_tokens,
     extract_technology_terms,
 )
 
 DEFAULT_THRESHOLD = 35.0
 DEFAULT_OUTPUT_DIR = Path(".data/tailored_resumes")
+DEFAULT_AI_OUTPUT_DIR = Path(".data/ai_resumes")
 LayoutVerifier = Callable[[Path, Path], None]
+ReviewCallback = Callable[[JobPosting, Path, str], bool]
 
 
 class ResumeService:
@@ -55,13 +82,60 @@ class ResumeService:
         threshold: float = DEFAULT_THRESHOLD,
         minimum_winner_margin: float = DEFAULT_MINIMUM_WINNER_MARGIN,
         output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+        ai_resume_path: str | Path = "",
+        ai_output_dir: str | Path = DEFAULT_AI_OUTPUT_DIR,
         planner: CurationPlanner | None = None,
+        bullet_planner: BulletRewritePlanner | None = None,
+        api_key: str | None = None,
         model: str | None = None,
         safety_identity: str = "",
         layout_verifier: LayoutVerifier | None = None,
+        review_callback: ReviewCallback | None = None,
     ) -> None:
         self.mode = mode
-        self._output_dir = Path(output_dir).expanduser().resolve()
+        self._output_dir = (
+            Path(ai_output_dir if mode is ResumeMode.AI_BULLETS else output_dir)
+            .expanduser()
+            .resolve()
+        )
+        self._planner: CurationPlanner | None = None
+        self._bullet_planner: BulletRewritePlanner | None = None
+        self._api_key = api_key.strip() if api_key else ""
+        self._planner_model: str | None = None
+        self._safety_identity = safety_identity
+        self._layout_verifier: LayoutVerifier | None = None
+        self._review_callback = review_callback
+        self._variants: tuple[ResumeVariant, ...]
+        self._selector: ResumeSelector | SingleResumeSelector
+
+        if mode is ResumeMode.AI_BULLETS:
+            if not ai_resume_path:
+                raise ResumeConfigurationError("A base DOCX resume is required for AI mode.")
+            path = validate_resume_path(ai_resume_path, tailored=True)
+            text = extract_resume_text(path)
+            custom_variant = ResumeVariant(
+                profile=CustomProfile.CUSTOM,
+                path=path,
+                text=text,
+                terms=extract_technology_terms(text),
+                lexical_tokens=extract_lexical_tokens(text),
+            )
+            self._variants = (custom_variant,)
+            self._selector = SingleResumeSelector(
+                custom_variant,
+                threshold,
+            )
+            self._bullet_planner = bullet_planner
+            if bullet_planner is not None:
+                self._api_key = ""
+            self._planner_model = (
+                model or os.getenv("OPENAI_MODEL") or DEFAULT_BULLET_REWRITE_MODEL
+            ).strip()
+            self._layout_verifier = (
+                layout_verifier if layout_verifier is not None else DocxLayoutVerifier()
+            )
+            return
+
         variants: list[ResumeVariant] = []
         resolved_paths: set[Path] = set()
         content_digests: set[str] = set()
@@ -96,19 +170,12 @@ class ResumeService:
             threshold,
             minimum_winner_margin=minimum_winner_margin,
         )
-        self._planner: CurationPlanner | None
         if mode is ResumeMode.TAILORED:
             self._planner = planner
             self._planner_model = model
-            self._safety_identity = safety_identity
-            self._layout_verifier: LayoutVerifier | None = (
+            self._layout_verifier = (
                 layout_verifier if layout_verifier is not None else DocxLayoutVerifier()
             )
-        else:
-            self._planner = None
-            self._planner_model = None
-            self._safety_identity = ""
-            self._layout_verifier = None
 
     @classmethod
     def from_settings(
@@ -116,8 +183,11 @@ class ResumeService:
         settings: Mapping[str, Any],
         *,
         planner: CurationPlanner | None = None,
+        bullet_planner: BulletRewritePlanner | None = None,
+        api_key: str | None = None,
         safety_identity: str = "",
         layout_verifier: LayoutVerifier | None = None,
+        review_callback: ReviewCallback | None = None,
     ) -> ResumeService:
         mode = ResumeMode.parse(str(settings.get("resume_mode", ResumeMode.STATIC.value)))
         raw_paths = settings.get("resume_paths", {})
@@ -129,17 +199,28 @@ class ResumeService:
             settings.get("minimum_winner_margin", DEFAULT_MINIMUM_WINNER_MARGIN)
         )
         output_dir = str(settings.get("tailored_resume_output_dir", DEFAULT_OUTPUT_DIR))
-        model = str(settings.get("openai_model", "")).strip() or None
+        ai_resume_path = str(settings.get("ai_resume_path", "")).strip()
+        ai_output_dir = str(settings.get("ai_resume_output_dir", DEFAULT_AI_OUTPUT_DIR))
+        model = (
+            os.getenv("OPENAI_MODEL", "").strip()
+            or str(settings.get("openai_model", "")).strip()
+            or None
+        )
         return cls(
             mode=mode,
             paths=paths,
             threshold=threshold,
             minimum_winner_margin=minimum_winner_margin,
             output_dir=output_dir,
+            ai_resume_path=ai_resume_path,
+            ai_output_dir=ai_output_dir,
             planner=planner,
+            bullet_planner=bullet_planner,
+            api_key=api_key,
             model=model,
             safety_identity=safety_identity,
             layout_verifier=layout_verifier,
+            review_callback=review_callback,
         )
 
     def evaluate(self, job: JobPosting) -> ResumePreparation:
@@ -181,13 +262,26 @@ class ResumeService:
             )
 
         try:
-            prepared_path = self._prepare_tailored(job, decision.selected_path)
+            prepared_path = (
+                self._prepare_ai_bullets(job, decision.selected_path)
+                if self.mode is ResumeMode.AI_BULLETS
+                else self._prepare_tailored(job, decision.selected_path)
+            )
         except ResumeTailoringError as exc:
             return ResumePreparation(
                 eligible=False,
                 reason=str(exc),
                 decision=decision,
             )
+        if self.mode is ResumeMode.AI_BULLETS:
+            try:
+                self._require_review_approval(job, decision.selected_path, prepared_path)
+            except ResumeTailoringError as exc:
+                return ResumePreparation(
+                    eligible=False,
+                    reason=str(exc),
+                    decision=decision,
+                )
         return ResumePreparation(
             eligible=True,
             reason=decision.reason,
@@ -206,6 +300,30 @@ class ResumeService:
         if not evaluation.eligible or evaluation.decision is None:
             return evaluation
         return self.prepare_selected(job, evaluation.decision)
+
+    def assert_prepared_resume_approved(
+        self,
+        job: JobPosting,
+        prepared: PreparedResume,
+    ) -> str:
+        """Revalidate an AI artifact and its exact-hash approval immediately before use."""
+
+        try:
+            output_digest = self._file_digest(prepared.path)
+        except OSError as exc:
+            raise ResumeTailoringError("Prepared resume is no longer readable.") from exc
+        if self.mode is not ResumeMode.AI_BULLETS:
+            return output_digest
+        source_path = prepared.decision.selected_path
+        if not self._cached_ai_output_is_valid(job, source_path, prepared.path):
+            raise ResumeTailoringError(
+                "AI-tailored resume changed after validation; the application was skipped."
+            )
+        if not self._ai_approval_is_valid(job, source_path, prepared.path):
+            raise ResumeTailoringError(
+                "AI-tailored resume approval is missing or no longer matches the exact file."
+            )
+        return output_digest
 
     def _prepare_tailored(self, job: JobPosting, source_path: Path) -> Path:
         from docx import Document
@@ -253,6 +371,294 @@ class ResumeService:
         if last_layout_error is not None:
             raise last_layout_error
         raise ResumeTailoringError("No safe tailored resume could be generated.")
+
+    def _prepare_ai_bullets(self, job: JobPosting, source_path: Path) -> Path:
+        from docx import Document
+
+        document = Document(str(source_path))
+        bullets = collect_editable_bullets(document)
+        if not bullets:
+            raise ResumeTailoringError(
+                "No safely editable experience bullets were found in the base DOCX."
+            )
+        if self._bullet_planner is None:
+            try:
+                self._bullet_planner = OpenAIBulletRewritePlanner(
+                    api_key=self._api_key or None,
+                    model=self._planner_model,
+                    safety_identity=self._safety_identity,
+                )
+            finally:
+                self._api_key = ""
+        self._planner_model = self._bullet_planner.model
+        output_path = self._ai_output_path(job, source_path, self._bullet_planner.model)
+        if output_path.exists() and self._cached_ai_output_is_valid(
+            job,
+            source_path,
+            output_path,
+        ):
+            return output_path
+
+        self._remove_ai_artifacts(output_path)
+        try:
+            raw_plan = self._bullet_planner.plan(job, bullets)
+        except ResumeTailoringError:
+            raise
+        except Exception as exc:
+            raise ResumeTailoringError("OpenAI could not produce a bullet rewrite plan.") from exc
+        source_text = next(
+            variant.text for variant in self._variants if variant.path == source_path
+        )
+        plan = validate_bullet_rewrite_plan(raw_plan, job, bullets, source_text)
+        try:
+            create_bullet_rewritten_docx(source_path, output_path, plan)
+            validate_bullet_rewritten_docx(source_path, output_path, plan)
+            if self._layout_verifier is None:
+                raise ResumeTailoringError("AI bullet mode has no layout verifier.")
+            self._layout_verifier(source_path, output_path)
+            self._write_ai_cache_manifest(job, source_path, output_path, plan)
+            return output_path
+        except ResumeTailoringError:
+            self._remove_ai_artifacts(output_path)
+            raise
+        except Exception as exc:
+            self._remove_ai_artifacts(output_path)
+            raise ResumeTailoringError("AI bullet resume generation failed safely.") from exc
+
+    @staticmethod
+    def _serialize_bullet_plan(plan: ValidatedBulletRewritePlan) -> dict[str, Any]:
+        return {
+            "reason_code": plan.reason_code,
+            "edits": [
+                {
+                    "bullet_id": edit.bullet_id,
+                    "replacement_bullets": list(edit.replacement_bullets),
+                    "source_bullet_ids": list(edit.source_bullet_ids),
+                }
+                for edit in plan.edits
+            ],
+        }
+
+    @staticmethod
+    def _deserialize_bullet_plan(value: object) -> ValidatedBulletRewritePlan:
+        if not isinstance(value, dict):
+            raise ResumeTailoringError("AI resume cache contained an invalid rewrite plan.")
+        reason_code = value.get("reason_code")
+        raw_edits = value.get("edits")
+        if not isinstance(reason_code, str) or not isinstance(raw_edits, list) or not raw_edits:
+            raise ResumeTailoringError("AI resume cache contained an invalid rewrite plan.")
+        if len(raw_edits) > MAX_EDITED_BULLETS:
+            raise ResumeTailoringError("AI resume cache contained an invalid rewrite plan.")
+        edits: list[ValidatedBulletEdit] = []
+        seen_bullet_ids: set[str] = set()
+        seen_replacements: set[str] = set()
+        for raw_edit in raw_edits:
+            if not isinstance(raw_edit, dict):
+                raise ResumeTailoringError("AI resume cache contained an invalid rewrite plan.")
+            bullet_id = raw_edit.get("bullet_id")
+            replacements = raw_edit.get("replacement_bullets")
+            source_ids = raw_edit.get("source_bullet_ids")
+            if (
+                not isinstance(bullet_id, str)
+                or bullet_id in seen_bullet_ids
+                or not isinstance(replacements, list)
+                or not replacements
+                or len(replacements) > MAX_REPLACEMENTS_PER_EDIT
+                or not all(isinstance(item, str) and item for item in replacements)
+                or any(len(item) > MAX_REPLACEMENT_BULLET_CHARS for item in replacements)
+                or not isinstance(source_ids, list)
+                or not source_ids
+                or len(source_ids) > MAX_SOURCE_BULLETS_PER_EDIT
+                or not all(isinstance(item, str) and item for item in source_ids)
+                or len(set(source_ids)) != len(source_ids)
+                or bullet_id not in source_ids
+            ):
+                raise ResumeTailoringError("AI resume cache contained an invalid rewrite plan.")
+            normalized_replacements = {" ".join(item.split()).casefold() for item in replacements}
+            if len(normalized_replacements) != len(replacements) or seen_replacements.intersection(
+                normalized_replacements
+            ):
+                raise ResumeTailoringError("AI resume cache contained an invalid rewrite plan.")
+            seen_bullet_ids.add(bullet_id)
+            seen_replacements.update(normalized_replacements)
+            edits.append(
+                ValidatedBulletEdit(
+                    bullet_id=bullet_id,
+                    replacement_bullets=tuple(replacements),
+                    source_bullet_ids=tuple(source_ids),
+                )
+            )
+        return ValidatedBulletRewritePlan(edits=tuple(edits), reason_code=reason_code)
+
+    def _cached_ai_output_is_valid(
+        self,
+        job: JobPosting,
+        source_path: Path,
+        output_path: Path,
+    ) -> bool:
+        manifest_path = self._manifest_path(output_path)
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                return False
+            if manifest.get("mode") != ResumeMode.AI_BULLETS.value:
+                return False
+            if manifest.get("layout_verified") is not True:
+                return False
+            if manifest.get("prompt_version") != BULLET_REWRITE_PROMPT_VERSION:
+                return False
+            if manifest.get("model") != self._planner_model:
+                return False
+            if manifest.get("job_sha256") != self._job_digest(job):
+                return False
+            if manifest.get("source_sha256") != self._file_digest(source_path):
+                return False
+            if manifest.get("output_sha256") != self._file_digest(output_path):
+                return False
+            plan = self._deserialize_bullet_plan(manifest.get("validated_plan"))
+            validate_resume_path(output_path, tailored=True)
+            validate_bullet_rewritten_docx(source_path, output_path, plan)
+            return True
+        except Exception:
+            return False
+
+    def _write_ai_cache_manifest(
+        self,
+        job: JobPosting,
+        source_path: Path,
+        output_path: Path,
+        plan: ValidatedBulletRewritePlan,
+    ) -> None:
+        manifest_path = self._manifest_path(output_path)
+        manifest_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary_path = manifest_path.with_suffix(f"{manifest_path.suffix}.tmp")
+        payload = {
+            "mode": ResumeMode.AI_BULLETS.value,
+            "layout_verified": True,
+            "source_sha256": self._file_digest(source_path),
+            "output_sha256": self._file_digest(output_path),
+            "job_sha256": self._job_digest(job),
+            "prompt_version": BULLET_REWRITE_PROMPT_VERSION,
+            "model": self._bullet_planner.model if self._bullet_planner is not None else "",
+            "validated_plan": self._serialize_bullet_plan(plan),
+        }
+        temporary_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        if temporary_path.stat().st_size == 0:
+            raise ResumeTailoringError("AI resume cache manifest could not be written.")
+        if os.name != "nt":
+            os.chmod(temporary_path, 0o600)
+        temporary_path.replace(manifest_path)
+
+    def _require_review_approval(
+        self,
+        job: JobPosting,
+        source_path: Path,
+        output_path: Path,
+    ) -> None:
+        if self._ai_approval_is_valid(job, source_path, output_path):
+            return
+        output_digest = self._file_digest(output_path)
+        if self._review_callback is None:
+            raise ResumeTailoringError(
+                "AI-tailored resume requires explicit review approval before submission."
+            )
+        try:
+            approved = self._review_callback(job, output_path, output_digest)
+        except Exception as exc:
+            raise ResumeTailoringError("AI resume review could not be completed safely.") from exc
+        if not approved:
+            raise ResumeTailoringError(
+                "AI-tailored resume was not approved; the application was skipped."
+            )
+        try:
+            current_digest = self._file_digest(output_path)
+        except OSError as exc:
+            raise ResumeTailoringError(
+                "AI-tailored resume became unreadable during review."
+            ) from exc
+        if current_digest != output_digest:
+            raise ResumeTailoringError(
+                "AI-tailored resume changed during review; regenerate and review it again."
+            )
+        try:
+            self._write_ai_approval(job, source_path, output_path, output_digest)
+        except Exception as exc:
+            raise ResumeTailoringError("AI resume approval could not be recorded safely.") from exc
+
+    def _ai_approval_is_valid(
+        self,
+        job: JobPosting,
+        source_path: Path,
+        output_path: Path,
+    ) -> bool:
+        approval_path = self._approval_path(output_path)
+        manifest_path = self._manifest_path(output_path)
+        try:
+            approval = json.loads(approval_path.read_text(encoding="utf-8"))
+            return bool(
+                isinstance(approval, dict)
+                and approval.get("approved") is True
+                and approval.get("source_sha256") == self._file_digest(source_path)
+                and approval.get("output_sha256") == self._file_digest(output_path)
+                and approval.get("job_sha256") == self._job_digest(job)
+                and approval.get("manifest_sha256") == self._file_digest(manifest_path)
+            )
+        except Exception:
+            return False
+
+    def _write_ai_approval(
+        self,
+        job: JobPosting,
+        source_path: Path,
+        output_path: Path,
+        expected_output_digest: str,
+    ) -> None:
+        approval_path = self._approval_path(output_path)
+        temporary_path = approval_path.with_suffix(f"{approval_path.suffix}.tmp")
+        if self._file_digest(output_path) != expected_output_digest:
+            raise ResumeTailoringError("AI-tailored resume changed before approval was recorded.")
+        payload = {
+            "approved": True,
+            "source_sha256": self._file_digest(source_path),
+            "output_sha256": expected_output_digest,
+            "job_sha256": self._job_digest(job),
+            "manifest_sha256": self._file_digest(self._manifest_path(output_path)),
+        }
+        temporary_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        if os.name != "nt":
+            os.chmod(temporary_path, 0o600)
+        temporary_path.replace(approval_path)
+
+    @staticmethod
+    def _approval_path(output_path: Path) -> Path:
+        return output_path.with_suffix(f"{output_path.suffix}.approval.json")
+
+    def _remove_ai_artifacts(self, output_path: Path) -> None:
+        output_path.unlink(missing_ok=True)
+        self._manifest_path(output_path).unlink(missing_ok=True)
+        self._approval_path(output_path).unlink(missing_ok=True)
+
+    @staticmethod
+    def _job_digest(job: JobPosting) -> str:
+        value = f"{job.url}\n{job.title}\n{job.description}"
+        return hashlib.sha256(value.encode()).hexdigest()
+
+    def _ai_output_path(self, job: JobPosting, source_path: Path, model: str) -> Path:
+        title_slug = re.sub(r"[^a-z0-9]+", "-", job.title.lower()).strip("-")[:60]
+        source_stat = source_path.stat()
+        cache_material = "|".join(
+            (
+                job.url,
+                hashlib.sha256(job.description.encode()).hexdigest(),
+                str(source_path),
+                str(source_stat.st_mtime_ns),
+                str(source_stat.st_size),
+                BULLET_REWRITE_PROMPT_VERSION,
+                model,
+            )
+        )
+        digest = hashlib.sha256(cache_material.encode()).hexdigest()[:12]
+        return self._output_dir / f"{title_slug or 'dice-job'}-{digest}.docx"
 
     @staticmethod
     def _candidate_orders(

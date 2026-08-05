@@ -3,6 +3,7 @@
 from .catalog import ResumeInspection, inspect_resume_catalog
 from .models import (
     CloudProfile,
+    CustomProfile,
     JobPosting,
     MatchDecision,
     PreparedResume,
@@ -13,6 +14,7 @@ from .service import ResumeService
 
 __all__ = [
     "CloudProfile",
+    "CustomProfile",
     "JobPosting",
     "MatchDecision",
     "PreparedResume",

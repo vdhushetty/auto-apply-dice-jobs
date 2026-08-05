@@ -1,18 +1,18 @@
 import os
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from dotenv import load_dotenv, set_key, find_dotenv
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
 
 from core.authorization import require_dice_automation_authorized
 
 
 LOGIN_PAGE_URL = "https://www.dice.com/dashboard/login"
-ACCOUNT_PROFILE_URL = "https://www.dice.com/dashboard/profiles"
+ACCOUNT_PROFILE_URL = "https://www.dice.com/profile/info"
+AUTHENTICATED_PROFILE_PATHS = {"/dashboard/profiles", "/profile/info"}
 
 
 def _profile_page_confirms_authenticated_session(
@@ -20,12 +20,15 @@ def _profile_page_confirms_authenticated_session(
     body_text,
     login_form_visible,
     account_control_visible,
+    page_ready=True,
 ):
     """Return True only when Dice's protected profile page shows account-only content."""
 
-    normalized_url = (current_url or "").lower()
+    current_path = urlparse(current_url or "").path.rstrip("/").lower()
     normalized_body = (body_text or "").lower()
-    if "/dashboard/profiles" not in normalized_url or login_form_visible:
+    if current_path not in AUTHENTICATED_PROFILE_PATHS or login_form_visible or not page_ready:
+        return False
+    if not normalized_body.strip():
         return False
     if any(
         marker in normalized_body
@@ -33,18 +36,23 @@ def _profile_page_confirms_authenticated_session(
             "log in to continue",
             "create an account or sign in",
             "checking your session",
+            "make your next move",
+            "verify you are human",
+            "oops! it looks like this page doesn't exist",
         )
     ):
         return False
-    return account_control_visible or any(
-        marker in normalized_body
-        for marker in (
-            "my profile",
-            "profile visibility",
-            "upload resume",
-            "work experience",
-        )
-    )
+    # Anonymous sessions are redirected away from this protected route. Account controls and
+    # known profile copy are useful positive signals, but a fully loaded protected route with no
+    # login/challenge/error surface is itself sufficient and avoids brittle text matching.
+    return True
+
+
+def _validation_failure(message, failure_callback=None):
+    print(f"Login failed: {message}")
+    if failure_callback is not None:
+        failure_callback(message)
+    return False
 
 def update_dice_credentials(username, password, update_env=True):
     """
@@ -92,37 +100,30 @@ def update_dice_credentials(username, password, update_env=True):
 
 def get_headless_driver():
     """
-    Creates a headless WebDriver for credential validation
+    Creates a headless WebDriver for credential validation with browser fallback.
     
     Returns:
         webdriver: A headless Chrome/Brave WebDriver instance
     """
-    try:
-        # Import browser detector if available
-        from core.browser_detector import get_browser_path
-        web_browser_path = get_browser_path()
-    except ImportError:
-        # Fallback if browser_detector is not available
-        web_browser_path = None
-    
-    options = Options()
-    
-    # Add headless options
-    options.add_argument("--headless")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-dev-shm-usage")
-    
-    # Set browser binary location if available
-    if web_browser_path:
-        options.binary_location = web_browser_path
-    
-    driver = webdriver.Chrome(options=options)
+    return get_validation_driver(headless=True)
+
+
+def get_validation_driver(headless=True):
+    """Create the shared validation driver in visible or headless mode."""
+
+    from core.main_script import get_web_driver
+
+    driver = get_web_driver(headless=headless)
     driver.set_page_load_timeout(25)
     return driver
 
-def validate_dice_credentials(username, password, headless=True):
+
+def validate_dice_credentials(
+    username,
+    password,
+    headless=True,
+    failure_callback=None,
+):
     """
     Validates Dice credentials by attempting to log in using a headless browser.
     With enhanced waiting times for slow login processes.
@@ -138,21 +139,7 @@ def validate_dice_credentials(username, password, headless=True):
     require_dice_automation_authorized()
     print("Validating Dice credentials...")
     
-    # Create driver (headless or regular)
-    if headless:
-        driver = get_headless_driver()
-    else:
-        # Import from main file to get regular driver
-        from core.browser_detector import get_browser_path
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-        
-        web_browser_path = get_browser_path()
-        options = Options()
-        options.binary_location = web_browser_path
-        options.add_argument("--start-maximized")
-        driver = webdriver.Chrome(options=options)
-        driver.set_page_load_timeout(25)
+    driver = get_validation_driver(headless=headless)
     
     try:
         overall_deadline = time.monotonic() + 80
@@ -228,16 +215,35 @@ def validate_dice_credentials(username, password, headless=True):
                 )
                 for message in visible_errors
             ):
-                print("Login failed: Dice rejected the credentials.")
-                return False
+                return _validation_failure(
+                    "Dice rejected the username or password.",
+                    failure_callback,
+                )
+
+            body_elements = driver.find_elements(By.TAG_NAME, "body")
+            body_text = body_elements[0].text.lower() if body_elements else ""
+            verification_markers = (
+                "verify you are human",
+                "verification code",
+                "one-time code",
+                "verify your identity",
+                "captcha",
+            )
+            if headless and any(marker in body_text for marker in verification_markers):
+                return _validation_failure(
+                    "Dice requires interactive verification. Turn off headless mode and retry.",
+                    failure_callback,
+                )
             time.sleep(0.5)
 
         # Verify against Dice's protected profile page. Public search forms and URL changes
         # alone are not sufficient evidence that Dice accepted the account session.
         remaining = overall_deadline - time.monotonic()
         if remaining <= 0:
-            print("Login failed: Dice login validation exceeded 80 seconds.")
-            return False
+            return _validation_failure(
+                "Dice login validation exceeded 80 seconds.",
+                failure_callback,
+            )
         driver.set_page_load_timeout(max(1, min(25, remaining)))
         driver.get(ACCOUNT_PROFILE_URL)
         while time.monotonic() < overall_deadline:
@@ -258,23 +264,33 @@ def validate_dice_credentials(username, password, headless=True):
             )
             body_elements = driver.find_elements(By.TAG_NAME, "body")
             body_text = body_elements[0].text if body_elements else ""
+            page_ready = driver.execute_script("return document.readyState") == "complete"
             if _profile_page_confirms_authenticated_session(
                 driver.current_url,
                 body_text,
                 login_form_visible,
                 account_control_visible,
+                page_ready,
             ):
                 print("Login successful with provided credentials!")
                 return True
             if login_form_visible and "/login" in (driver.current_url or "").lower():
-                print("Login failed: Dice returned to the sign-in page.")
-                return False
+                return _validation_failure(
+                    "Dice returned to the sign-in page. Check the username and password.",
+                    failure_callback,
+                )
             time.sleep(0.5)
-        print("Login failed: Dice did not confirm an authenticated session within 80 seconds.")
-        return False
+        final_path = urlparse(driver.current_url or "").path or "/"
+        return _validation_failure(
+            "Dice did not confirm an authenticated session within 80 seconds "
+            f"(final page: {final_path}). Turn off headless mode if Dice requires verification.",
+            failure_callback,
+        )
             
     except Exception as e:
         print(f"Error validating credentials: {e}")
+        if failure_callback is not None:
+            failure_callback(str(e))
         return False
     finally:
         try:

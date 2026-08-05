@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Sequence
+from typing import cast
 
-from .models import CloudProfile, JobPosting, MatchDecision, ResumeVariant
+from .models import CloudProfile, CustomProfile, JobPosting, MatchDecision, ResumeVariant
 
 TECH_ALIASES: dict[str, tuple[str, ...]] = {
     "aws": ("aws", "amazon web services"),
@@ -409,6 +410,8 @@ class ResumeSelector:
         if not 0.0 <= minimum_winner_margin <= 100.0:
             raise ValueError("The minimum winner margin must be between 0 and 100.")
         self._variants = tuple(variants)
+        if any(not isinstance(variant.profile, CloudProfile) for variant in self._variants):
+            raise ValueError("The three-resume selector accepts cloud profiles only.")
         self._threshold = float(threshold)
         self._minimum_winner_margin = float(minimum_winner_margin)
 
@@ -422,18 +425,20 @@ class ResumeSelector:
         scores: dict[CloudProfile, float] = {}
 
         for variant in self._variants:
+            profile = cast(CloudProfile, variant.profile)
             tech_score = _weighted_coverage(title_terms, description_terms, variant.terms)
             lexical_score = _lexical_coverage(job, variant.lexical_tokens)
             score = 0.80 * tech_score + 0.20 * lexical_score if job_terms else 0.50 * lexical_score
-            score += _provider_bonus(variant.profile, job_terms)
-            scores[variant.profile] = round(max(0.0, min(100.0, score)), 2)
+            score += _provider_bonus(profile, job_terms)
+            scores[profile] = round(max(0.0, min(100.0, score)), 2)
+
+        def score_key(variant: ResumeVariant) -> tuple[float, int]:
+            profile = cast(CloudProfile, variant.profile)
+            return scores[profile], -list(CloudProfile).index(profile)
 
         ranked = sorted(
             self._variants,
-            key=lambda variant: (
-                scores[variant.profile],
-                -list(CloudProfile).index(variant.profile),
-            ),
+            key=score_key,
             reverse=True,
         )
         selected = (
@@ -441,9 +446,10 @@ class ResumeSelector:
             if explicit_title_profile is not None
             else ranked[0]
         )
-        selected_score = scores[selected.profile]
+        selected_profile = cast(CloudProfile, selected.profile)
+        selected_score = scores[selected_profile]
         runner_up_score = max(
-            score for profile, score in scores.items() if profile is not selected.profile
+            score for profile, score in scores.items() if profile is not selected_profile
         )
         score_margin = round(selected_score - runner_up_score, 2)
         ambiguous = explicit_title_profile is None and score_margin < self._minimum_winner_margin
@@ -451,7 +457,7 @@ class ResumeSelector:
         missing = sorted(job_terms.difference(selected.terms))
         missing_required = sorted(required_terms.difference(selected.terms))
         return MatchDecision(
-            selected_profile=selected.profile,
+            selected_profile=selected_profile,
             selected_path=selected.path,
             score=selected_score,
             threshold=self._threshold,
@@ -469,6 +475,48 @@ class ResumeSelector:
             score_margin=score_margin,
             minimum_winner_margin=self._minimum_winner_margin,
             explicit_title_profile=explicit_title_profile,
+            manual_review_reasons=manual_review_reasons,
+        )
+
+
+class SingleResumeSelector:
+    """Evaluate one user-provided resume against the title and full job description."""
+
+    def __init__(self, variant: ResumeVariant, threshold: float) -> None:
+        if variant.profile is not CustomProfile.CUSTOM:
+            raise ValueError("The single-resume selector requires the custom resume profile.")
+        if not 0.0 <= threshold <= 100.0:
+            raise ValueError("The relevance threshold must be between 0 and 100.")
+        self._variant = variant
+        self._threshold = float(threshold)
+
+    def select(self, job: JobPosting) -> MatchDecision:
+        title_terms = extract_technology_terms(job.title)
+        description_terms = extract_technology_terms(job.description)
+        job_terms = title_terms | description_terms
+        required_terms = extract_required_technology_terms(job.description)
+        manual_review_reasons = detect_manual_review_reasons(f"{job.title}\n{job.description}")
+
+        tech_score = _weighted_coverage(title_terms, description_terms, self._variant.terms)
+        lexical_score = _lexical_coverage(job, self._variant.lexical_tokens)
+        score = 0.80 * tech_score + 0.20 * lexical_score if job_terms else 0.50 * lexical_score
+        score = round(max(0.0, min(100.0, score)), 2)
+        matched = tuple(sorted(job_terms.intersection(self._variant.terms)))
+        missing = tuple(sorted(job_terms.difference(self._variant.terms)))
+        missing_required = tuple(sorted(required_terms.difference(self._variant.terms)))
+
+        return MatchDecision(
+            selected_profile=CustomProfile.CUSTOM,
+            selected_path=self._variant.path,
+            score=score,
+            threshold=self._threshold,
+            eligible=(
+                score >= self._threshold and not missing_required and not manual_review_reasons
+            ),
+            matched_terms=matched,
+            missing_terms=missing,
+            missing_required_terms=missing_required,
+            variant_scores={CustomProfile.CUSTOM.value: score},
             manual_review_reasons=manual_review_reasons,
         )
 

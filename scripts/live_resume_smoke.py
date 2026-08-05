@@ -1,4 +1,4 @@
-"""Opt-in live OpenAI smoke test using three local DOCX resumes and synthetic jobs."""
+"""Opt-in live OpenAI smoke tests using local DOCX resumes and synthetic jobs."""
 
 from __future__ import annotations
 
@@ -32,8 +32,14 @@ SYNTHETIC_JOBS = (
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        choices=(ResumeMode.TAILORED.value, ResumeMode.AI_BULLETS.value),
+        default=ResumeMode.TAILORED.value,
+    )
     for profile in CloudProfile:
-        parser.add_argument(f"--{profile.value}", required=True, type=Path)
+        parser.add_argument(f"--{profile.value}", type=Path)
+    parser.add_argument("--base", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path(".data/live-resume-smoke"))
     return parser
 
@@ -44,6 +50,42 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     load_dotenv()
     args = _parser().parse_args(argv)
+    if args.mode == ResumeMode.AI_BULLETS.value:
+        if args.base is None:
+            raise SystemExit("--base is required for ai_bullets smoke mode")
+        service = ResumeService(
+            mode=ResumeMode.AI_BULLETS,
+            paths={},
+            ai_resume_path=args.base,
+            threshold=20,
+            ai_output_dir=args.output_dir,
+            api_key=os.getenv("OPENAI_API_KEY", ""),
+            review_callback=lambda job, path, digest: True,
+        )
+        result = service.prepare(
+            JobPosting(
+                title="Data Engineer",
+                description=(
+                    "Required: Python and SQL experience building reliable data pipelines "
+                    "and governed analytics systems."
+                ),
+                url="https://www.dice.com/job-detail/synthetic-ai-bullet-live-smoke",
+            )
+        )
+        if not result.eligible or result.prepared is None or not result.prepared.tailored:
+            print(f"FAIL ai_bullets: {result.reason}")
+            return 1
+        print("PASS ai_bullets: reviewed DOCX created with rendered page-count parity")
+        return 0
+
+    missing_profiles = [
+        profile.value for profile in CloudProfile if getattr(args, profile.value) is None
+    ]
+    if missing_profiles:
+        raise SystemExit(
+            "tailored smoke mode requires: "
+            + ", ".join(f"--{profile}" for profile in missing_profiles)
+        )
     paths = {profile: getattr(args, profile.value) for profile in CloudProfile}
     service = ResumeService(
         mode=ResumeMode.TAILORED,

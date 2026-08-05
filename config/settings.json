@@ -53,7 +53,10 @@
         "azure": "",
         "gcp": ""
     },
+    "ai_resume_path": "",
     "minimum_match_score": 35,
     "minimum_winner_margin": 5,
-    "tailored_resume_output_dir": ".data/tailored_resumes"
+    "tailored_resume_output_dir": ".data/tailored_resumes",
+    "ai_resume_output_dir": ".data/ai_resumes",
+    "openai_model": "gpt-5.6-sol"
 }

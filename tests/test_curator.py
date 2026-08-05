@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from docx import Document
 
-from core.resumes.curator import OpenAICurationPlanner, validate_curation_plan
+from core.resumes.bullet_curator import (
+    DEFAULT_BULLET_REWRITE_MODEL,
+    EditableBullet,
+)
+from core.resumes.curator import (
+    OpenAIBulletRewritePlanner,
+    OpenAICurationPlanner,
+    validate_curation_plan,
+)
 from core.resumes.documents import collect_skill_slots
 from core.resumes.models import JobPosting, ResumeTailoringError
 
@@ -120,3 +130,56 @@ def test_openai_boundary_is_stateless_structured_and_instruction_safe(
     assert "tools" not in kwargs
     assert "untrusted data" in kwargs["instructions"]
     assert "OPENAI_API_KEY" not in kwargs["input"]
+
+
+def test_bullet_rewrite_boundary_is_bounded_private_and_instruction_safe() -> None:
+    payload = {
+        "schema_version": "1",
+        "outcome": "rewrite",
+        "reason_code": "ok",
+        "job_evidence": [{"quote": "AWS", "priority": "required"}],
+        "edits": [
+            {
+                "bullet_id": "opaque-bullet-1",
+                "replacement_bullets": ["Built AWS pipelines."],
+                "source_bullet_ids": ["opaque-bullet-1"],
+            }
+        ],
+    }
+    planner = OpenAIBulletRewritePlanner.__new__(OpenAIBulletRewritePlanner)
+    planner.model = "test-model"
+    planner._client = FakeClient(json.dumps(payload))
+    planner._safety_identifier = "hashed-local-user"
+    editable = (
+        EditableBullet(
+            bullet_id="opaque-bullet-1",
+            text="Built AWS data pipelines.",
+            section="Experience at Private Employer",
+            group_id="opaque-group-1",
+        ),
+    )
+
+    parsed = planner.plan(job(), editable)
+
+    assert parsed == payload
+    kwargs = planner._client.responses.kwargs
+    assert kwargs["model"] == "test-model"
+    assert kwargs["reasoning"] == {"effort": "low"}
+    assert kwargs["store"] is False
+    assert kwargs["safety_identifier"] == "hashed-local-user"
+    assert kwargs["text"]["format"]["strict"] is True
+    assert kwargs["text"]["format"]["schema"]["properties"]["edits"]["maxItems"] == 4
+    assert "untrusted data" in kwargs["instructions"]
+    assert "Never invent" in kwargs["instructions"]
+    assert "employers or clients" in kwargs["instructions"]
+    assert "dates or tenure" in kwargs["instructions"]
+    assert "metrics or other numbers" in kwargs["instructions"]
+    request_payload = json.loads(kwargs["input"])
+    sent_bullet = request_payload["candidate_authored_editable_bullets"][0]
+    assert set(sent_bullet) == {"bullet_id", "text", "group_id"}
+    assert "Private Employer" not in kwargs["input"]
+    assert "OPENAI_API_KEY" not in kwargs["input"]
+
+
+def test_bullet_rewrite_model_default_is_current_product_choice() -> None:
+    assert DEFAULT_BULLET_REWRITE_MODEL == "gpt-5.6-sol"

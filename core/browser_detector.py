@@ -141,7 +141,10 @@ def detect_browser_paths():
         set_key(dotenv_path, "WEB_BROWSER_PATH", "")  # Clear the browser path
     
     # ChromeDriver supports these Chromium-family browser binaries.
-    preferred_order = ["Brave", "Chrome", "Chromium"]
+    # Chrome is the most reliable target for Selenium Manager's ChromeDriver. Brave remains
+    # available as a fallback, but some Brave/macOS releases exit during headless startup even
+    # when their Chromium major version matches ChromeDriver.
+    preferred_order = ["Chrome", "Brave", "Chromium"]
     
     # Return the first browser found in the preferred order
     selected_browser = None

@@ -1,0 +1,3 @@
+{"name":"custom_aws_supported","title":"AWS Data Engineer","description":"Required: AWS Glue, S3, Python, SQL, and Spark.","eligible":true}
+{"name":"custom_missing_gcp_requirements","title":"GCP Data Engineer","description":"Requirements:\n- GCP\n- BigQuery\n- Dataflow\n- Python\n- SQL","eligible":false,"missing_required_terms":["gcp","gcp-bigquery","gcp-dataflow"]}
+{"name":"custom_manual_review_restriction","title":"AWS Data Engineer","description":"Required: AWS Glue, S3, Python, and SQL. W2 candidates only.","eligible":false,"manual_review_reasons":["W2-only or no-C2C restriction"]}
