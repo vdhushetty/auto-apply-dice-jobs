@@ -865,6 +865,40 @@ def test_resume_picker_uses_nearby_resume_prompt_for_generic_input(
     assert not driver.submit_button.clicked
 
 
+def test_unlabeled_file_input_reports_safe_selector_metadata(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    resume = tmp_path / "aws.docx"
+    resume.touch()
+    driver = WizardDriver(has_file_input=True, has_next=True)
+    assert driver.file_input is not None
+    driver.file_input.attributes = {
+        "name": "attachment",
+        "id": "file-upload",
+        "data-testid": "generic-file-picker",
+        "accept": ".pdf,.docx",
+    }
+    monkeypatch.setattr(main_script, "_extract_job_description", lambda current: "AWS " * 50)
+    monkeypatch.setattr(main_script, "WebDriverWait", ImmediateWait)
+
+    result = apply_to_job_url(
+        driver,
+        {"Job Title": "AWS Engineer", "Job URL": "https://www.dice.com/job-detail/unlabeled"},
+        PreparedService(resume),  # type: ignore[arg-type]
+        run_mode=RunMode.VERIFY_UPLOAD,
+    )
+
+    assert result.status is ApplicationStatus.FAILED
+    assert "none could be safely identified" in result.reason
+    assert (
+        "input-1(name=attachment; id=file-upload; data-testid=generic-file-picker" in result.reason
+    )
+    assert str(tmp_path) not in result.reason
+    assert not driver.next_button.clicked
+    assert not driver.submit_button.clicked
+
+
 def test_disabled_already_applied_control_is_detected(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
     resume = tmp_path / "aws.docx"
     resume.touch()

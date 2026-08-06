@@ -576,6 +576,26 @@ def _file_input_descriptor(driver, file_input) -> str:
     return " ".join(descriptor.split())
 
 
+def _safe_file_input_attribute(value: object) -> str:
+    """Return selector-relevant metadata without exposing file values or page content."""
+
+    compact = re.sub(r"[^a-z0-9._:-]+", "-", str(value or "").casefold()).strip("-")
+    return compact[:80] or "none"
+
+
+def _file_input_signature(file_input, position: int) -> str:
+    """Describe only stable, non-content attributes for a failed upload diagnosis."""
+
+    attributes: list[str] = []
+    for attribute in ("name", "id", "data-testid", "aria-label", "accept"):
+        try:
+            value = file_input.get_attribute(attribute)
+        except Exception:
+            value = ""
+        attributes.append(f"{attribute}={_safe_file_input_attribute(value)}")
+    return f"input-{position}({'; '.join(attributes)})"
+
+
 def _upload_resume_if_present(
     driver,
     resume_path: str,
@@ -592,11 +612,15 @@ def _upload_resume_if_present(
         if _RESUME_INPUT_TERM.search(descriptor) and not _NON_RESUME_INPUT_TERM.search(descriptor):
             resume_inputs.append(file_input)
     if not resume_inputs:
+        signatures = ", ".join(
+            _file_input_signature(file_input, position)
+            for position, file_input in enumerate(inputs, start=1)
+        )
         return (
             True,
             False,
             "Dice showed file input controls, but none could be safely identified as a "
-            "resume/CV field.",
+            f"resume/CV field. Field metadata: {signatures}",
         )
     if len(resume_inputs) != 1:
         return (
