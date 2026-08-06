@@ -1,20 +1,21 @@
 # dice_auto_apply/app_tkinter.py
 
+import hashlib
+import json
+import logging
 import os
 import queue
-import sys
-import hashlib
-import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext, ttk
-import threading
-import json
-import pandas as pd
-from datetime import datetime
-import time
-import logging
 import re
 import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
 from collections import Counter
+from datetime import datetime
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+
+import pandas as pd
 
 from core.authorization import DiceAuthorizationError, require_dice_automation_authorized
 from core.dice_login import (
@@ -38,7 +39,7 @@ from core.main_script import (
 )
 from core.resumes import ResumeService, inspect_resume_catalog
 from core.resumes.models import CloudProfile, ResumeError
-
+from scripts.run_role_ordered import run as run_role_ordered
 
 AI_REVIEW_POLICY_LABELS = {
     "review_before_apply": "Review before apply",
@@ -46,9 +47,7 @@ AI_REVIEW_POLICY_LABELS = {
 }
 AI_REVIEW_POLICY_VALUES = {label: value for value, label in AI_REVIEW_POLICY_LABELS.items()}
 _SECRET_LIKE_TOKEN = re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}\b", re.IGNORECASE)
-_LOCAL_PATH = re.compile(
-    r"(?<!:)/(?:Users|home|tmp|private|var)/[^,;\n]+|[A-Za-z]:\\[^,;\n]+"
-)
+_LOCAL_PATH = re.compile(r"(?<!:)/(?:Users|home|tmp|private|var)/[^,;\n]+|[A-Za-z]:\\[^,;\n]+")
 
 
 def _safe_ui_message(value, max_chars=240):
@@ -621,9 +620,7 @@ class DiceAutoBotApp:
             wraplength=720,
         )
         self.current_step_label.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
-        ttk.Label(activity_frame, text="Resume:").grid(
-            row=2, column=0, sticky="nw", padx=5, pady=2
-        )
+        ttk.Label(activity_frame, text="Resume:").grid(row=2, column=0, sticky="nw", padx=5, pady=2)
         self.current_resume_label = ttk.Label(
             activity_frame,
             text="Pending",
@@ -1680,6 +1677,13 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
         session_cookies,
     ):
         """Run the job application process in a background thread"""
+        if run_mode is RunMode.SUBMIT:
+            self._run_role_ordered_submission(
+                job_limit,
+                resume_service.mode.value,
+                self.selected_ai_review_policy(),
+            )
+            return
         driver = None
         start_time = time.time()
         jobs_to_apply = []
@@ -2254,9 +2258,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
 
         except Exception as e:
             error_message = _safe_ui_message(e)
-            self.logger.error(
-                f"Run stopped after {type(e).__name__}: {error_message}"
-            )
+            self.logger.error(f"Run stopped after {type(e).__name__}: {error_message}")
             show_current_stop(f"{type(e).__name__}: {error_message}")
             self.post_ui(
                 lambda message=error_message: messagebox.showerror(
@@ -2272,6 +2274,69 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             # Reset UI
             self.reset_ui()
 
+    def _run_role_ordered_submission(self, job_limit, resume_mode, review_policy):
+        """Drive the durable, role-by-role Submit flow from the desktop Start button."""
+
+        if resume_mode == "ai_bullets" and review_policy != "skip_review":
+            message = (
+                "Submit is configured for Review before apply. Choose Skip review in Settings "
+                "and save it before starting an unattended role-ordered run."
+            )
+            self.update_status(message)
+            self.post_ui(lambda: messagebox.showwarning("Review Policy Required", message))
+            self.reset_ui()
+            return
+
+        counts = Counter()
+
+        def record(entry):
+            status = str(entry.get("status", "failed"))
+            title = _safe_ui_message(entry.get("job_title", "Unknown"), 120)
+            counts[status] += 1
+            self.update_status(f"Role-ordered run: {status.replace('_', ' ')} — {title}")
+            if status == ApplicationStatus.APPLIED.value:
+                self.post_ui(
+                    lambda count=counts[status]: self.jobs_applied_label.config(text=str(count))
+                )
+            elif status in {
+                ApplicationStatus.SKIPPED.value,
+                ApplicationStatus.ALREADY_APPLIED.value,
+            }:
+                self.post_ui(
+                    lambda count=counts[status]: self.jobs_skipped_label.config(text=str(count))
+                )
+            elif status == ApplicationStatus.FAILED.value:
+                self.post_ui(
+                    lambda count=counts[status]: self.jobs_failed_label.config(text=str(count))
+                )
+
+        try:
+            self.update_status("Starting saved role-ordered Dice submission run...")
+            submitted = run_role_ordered(
+                job_limit,
+                skip_review=True,
+                event_callback=record,
+                cancel_requested=lambda: not self.running,
+            )
+            summary = (
+                f"Role-ordered run completed. Dice confirmed {submitted} new application"
+                f"{'s' if submitted != 1 else ''}."
+            )
+            self.update_status(summary)
+            self.post_ui(
+                lambda: messagebox.showinfo(
+                    "Process Complete",
+                    f"{summary}\n\nA resumable local ledger is stored under .data/role_ordered_runs/.",
+                )
+            )
+        except Exception as exc:
+            message = _safe_ui_message(exc)
+            self.logger.error(f"Role-ordered run stopped: {message}")
+            self.update_status(f"Role-ordered run stopped: {message}")
+            self.post_ui(lambda: messagebox.showerror("Error", message))
+        finally:
+            self.reset_ui()
+
     def stop_applying(self):
         """Stop the job application process"""
         if not self.running:
@@ -2284,6 +2349,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
 
     def reset_ui(self):
         """Reset UI after job completion or stop"""
+
         def reset_controls():
             self.running = False
             self.start_button.config(state="normal")
@@ -2312,10 +2378,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             if event.stage is ApplicationProgressStage.OPENING_JOB:
                 self.current_resume_label.config(text="Pending")
             elif event.stage is ApplicationProgressStage.COMPLETED:
-                if (
-                    self.current_resume_label.cget("text") == "Pending"
-                    and resume_text != "Pending"
-                ):
+                if self.current_resume_label.cget("text") == "Pending" and resume_text != "Pending":
                     self.current_resume_label.config(text=resume_text)
             elif resume_text != "Pending":
                 self.current_resume_label.config(text=resume_text)

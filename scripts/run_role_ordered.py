@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -79,7 +79,14 @@ def _outcome_entry(query: str, job: Mapping[str, Any], result) -> dict[str, Any]
     }
 
 
-def run(limit: int, *, skip_review: bool, ledger_path: Path = LEDGER_PATH) -> int:
+def run(
+    limit: int,
+    *,
+    skip_review: bool,
+    ledger_path: Path = LEDGER_PATH,
+    event_callback: Callable[[Mapping[str, Any]], None] | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> int:
     """Apply to at most ``limit`` new, Dice-confirmed jobs in configured query order."""
 
     if limit < 1:
@@ -115,6 +122,8 @@ def run(limit: int, *, skip_review: bool, ledger_path: Path = LEDGER_PATH) -> in
         if not authenticated:
             raise RuntimeError("Dice authentication was not confirmed.")
         for index, query in enumerate(queries):
+            if cancel_requested is not None and cancel_requested():
+                break
             if submitted >= limit:
                 break
             jobs, _ = fetch_jobs_with_requests(
@@ -137,14 +146,25 @@ def run(limit: int, *, skip_review: bool, ledger_path: Path = LEDGER_PATH) -> in
                 fresh_jobs,
                 service,
                 limit=max(1, limit - submitted),
+                cancel_requested=cancel_requested,
             )
             for job in (*selection.selected_jobs, *selection.deferred_jobs):
+                if cancel_requested is not None and cancel_requested():
+                    break
                 if submitted >= limit:
                     break
-                result = apply_to_job_url(driver, job, service, run_mode=RunMode.SUBMIT)
+                result = apply_to_job_url(
+                    driver,
+                    job,
+                    service,
+                    run_mode=RunMode.SUBMIT,
+                    cancel_requested=cancel_requested,
+                )
                 entry = _outcome_entry(query, job, result)
                 _append_ledger(ledger_path, entry)
                 print(json.dumps(entry, ensure_ascii=False), flush=True)
+                if event_callback is not None:
+                    event_callback(entry)
                 if result.status is ApplicationStatus.APPLIED:
                     submitted += 1
     finally:
