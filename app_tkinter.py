@@ -13,11 +13,17 @@ import time
 import tkinter as tk
 from collections import Counter
 from datetime import datetime
+from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import pandas as pd
 
 from core.authorization import DiceAuthorizationError, require_dice_automation_authorized
+from core.application_dashboard import (
+    dashboard_skip_reason_counts,
+    dashboard_status_counts,
+    load_application_dashboard,
+)
 from core.dice_login import (
     authenticate_dice_session,
     get_dice_session_cookies,
@@ -211,16 +217,19 @@ class DiceAutoBotApp:
         # Create tab frames
         self.main_tab = ttk.Frame(self.notebook)
         self.settings_tab = ttk.Frame(self.notebook)
+        self.dashboard_tab = ttk.Frame(self.notebook)
         self.logs_tab = ttk.Frame(self.notebook)
 
         # Add tabs to notebook
         self.notebook.add(self.main_tab, text="Run Bot")
         self.notebook.add(self.settings_tab, text="Settings")
+        self.notebook.add(self.dashboard_tab, text="Applications")
         self.notebook.add(self.logs_tab, text="Logs")
 
         # Set up UI for each tab
         self.setup_main_tab()
         self.setup_settings_tab()
+        self.setup_dashboard_tab()
         self.setup_logs_tab()
 
         # Log that app is started
@@ -1250,6 +1259,184 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             if not self.running or time.monotonic() >= review_deadline:
                 return False
         return bool(result["approved"])
+
+    def setup_dashboard_tab(self):
+        """Show durable Dice outcomes, skip reasons, and generated-resume edits."""
+
+        self.dashboard_records = ()
+        self.dashboard_filter_var = tk.StringVar(value="All")
+        self.dashboard_summary_var = tk.StringVar(value="No recorded applications yet.")
+
+        header = ttk.Frame(self.dashboard_tab)
+        header.pack(fill="x", padx=10, pady=(10, 4))
+        ttk.Label(header, text="Application dashboard", font=("Arial", 14, "bold")).pack(
+            side="left"
+        )
+        ttk.Button(header, text="Refresh", command=self.refresh_application_dashboard).pack(
+            side="right"
+        )
+
+        controls = ttk.Frame(self.dashboard_tab)
+        controls.pack(fill="x", padx=10, pady=4)
+        ttk.Label(controls, text="Show:").pack(side="left")
+        status_filter = ttk.Combobox(
+            controls,
+            textvariable=self.dashboard_filter_var,
+            values=("All", "Applied", "Skipped", "Failed", "Already applied"),
+            state="readonly",
+            width=18,
+        )
+        status_filter.pack(side="left", padx=(5, 14))
+        status_filter.bind(
+            "<<ComboboxSelected>>", lambda _event: self.refresh_application_dashboard()
+        )
+        ttk.Label(controls, textvariable=self.dashboard_summary_var).pack(side="left", fill="x")
+
+        table_frame = ttk.Frame(self.dashboard_tab)
+        table_frame.pack(fill="both", expand=True, padx=10, pady=(4, 6))
+        columns = ("status", "role", "job", "resume", "changes", "reason")
+        self.dashboard_tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings",
+            selectmode="browse",
+            height=13,
+        )
+        headings = {
+            "status": "Status",
+            "role": "Role",
+            "job": "Job",
+            "resume": "Uploaded resume",
+            "changes": "Edits",
+            "reason": "Why / outcome",
+        }
+        widths = {
+            "status": 100,
+            "role": 115,
+            "job": 230,
+            "resume": 190,
+            "changes": 55,
+            "reason": 360,
+        }
+        for column in columns:
+            self.dashboard_tree.heading(column, text=headings[column])
+            self.dashboard_tree.column(column, width=widths[column], minwidth=55, anchor="w")
+        scroll_y = ttk.Scrollbar(table_frame, orient="vertical", command=self.dashboard_tree.yview)
+        self.dashboard_tree.configure(yscrollcommand=scroll_y.set)
+        self.dashboard_tree.pack(side="left", fill="both", expand=True)
+        scroll_y.pack(side="right", fill="y")
+        self.dashboard_tree.bind("<<TreeviewSelect>>", self.show_dashboard_record)
+
+        detail_frame = ttk.LabelFrame(
+            self.dashboard_tab, text="Selected job details and resume changes"
+        )
+        detail_frame.pack(fill="both", padx=10, pady=(0, 10))
+        self.dashboard_details = scrolledtext.ScrolledText(detail_frame, height=11, wrap=tk.WORD)
+        self.dashboard_details.pack(fill="both", expand=True, padx=6, pady=6)
+        self.dashboard_details.configure(state="disabled")
+        actions = ttk.Frame(detail_frame)
+        actions.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Button(actions, text="Open selected resume", command=self.open_dashboard_resume).pack(
+            side="left"
+        )
+        self.refresh_application_dashboard()
+
+    def refresh_application_dashboard(self):
+        ledger = Path(".data/role_ordered_runs/ledger.jsonl")
+        resume_directory = Path(self.ai_resume_output_dir).expanduser()
+        self.dashboard_records = load_application_dashboard(ledger, resume_directory)
+        selected_filter = self.dashboard_filter_var.get().casefold().replace(" ", "_")
+        visible_records = [
+            record
+            for record in self.dashboard_records
+            if selected_filter == "all" or record.status == selected_filter
+        ]
+        counts = dashboard_status_counts(self.dashboard_records)
+        skip_reasons = dashboard_skip_reason_counts(self.dashboard_records)
+        summary = (
+            f"Applied: {counts['applied']}   Skipped: {counts['skipped']}   "
+            f"Failed: {counts['failed']}   Already applied: {counts['already_applied']}"
+        )
+        if skip_reasons:
+            summary += f"   Top skip: {_safe_ui_message(skip_reasons.most_common(1)[0][0], 105)}"
+        self.dashboard_summary_var.set(summary)
+        for item in self.dashboard_tree.get_children():
+            self.dashboard_tree.delete(item)
+        for index, record in enumerate(visible_records):
+            self.dashboard_tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(
+                    record.status.replace("_", " ").title(),
+                    record.query,
+                    _safe_ui_message(record.job_title, 60),
+                    record.resume_filename or "—",
+                    len(record.changes),
+                    _safe_ui_message(record.reason, 110),
+                ),
+            )
+        self.dashboard_visible_records = tuple(visible_records)
+        self._set_dashboard_details("Select a job to see its exact outcome and resume edits.")
+
+    def _set_dashboard_details(self, text):
+        self.dashboard_details.configure(state="normal")
+        self.dashboard_details.delete("1.0", tk.END)
+        self.dashboard_details.insert(tk.END, text)
+        self.dashboard_details.configure(state="disabled")
+
+    def show_dashboard_record(self, _event=None):
+        selection = self.dashboard_tree.selection()
+        if not selection:
+            return
+        record = self.dashboard_visible_records[int(selection[0])]
+        lines = [
+            f"Job: {record.job_title}",
+            f"Role: {record.query or 'Unknown'}",
+            f"Status: {record.status.replace('_', ' ').title()}",
+            f"Completed: {record.completed_at or 'Unknown'}",
+            f"Dice URL: {record.job_url or 'Unavailable'}",
+            "",
+            f"Outcome: {record.reason or 'No reason recorded.'}",
+            "",
+        ]
+        if record.resume_filename:
+            lines.append(f"Resume Dice verified: {record.resume_filename}")
+            lines.append(
+                "Local copy: available"
+                if record.resume_path is not None
+                else "Local copy: not found"
+            )
+            lines.append("")
+        if record.changes:
+            lines.append("Validated resume bullet changes:")
+            for change in record.changes:
+                lines.append(f"• {change.bullet_id} replaced with:")
+                lines.extend(f"  – {bullet}" for bullet in change.replacement_bullets)
+        elif record.resume_filename:
+            lines.append("No AI bullet rewrite manifest was found for this resume.")
+        else:
+            lines.append("No resume was uploaded because this job was skipped or failed first.")
+        self._set_dashboard_details("\n".join(lines))
+
+    def open_dashboard_resume(self):
+        selection = self.dashboard_tree.selection()
+        if not selection:
+            messagebox.showinfo("Applications", "Select a job with a local resume first.")
+            return
+        record = self.dashboard_visible_records[int(selection[0])]
+        if record.resume_path is None:
+            messagebox.showinfo("Applications", "This job has no available local resume file.")
+            return
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", str(record.resume_path)])
+            elif os.name == "nt":
+                os.startfile(record.resume_path)  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", str(record.resume_path)])
+        except OSError as exc:
+            messagebox.showerror("Applications", f"Could not open the selected resume: {exc}")
 
     def setup_logs_tab(self):
         """Set up the logs tab UI"""
