@@ -557,10 +557,14 @@ def _file_input_descriptor(driver, file_input) -> str:
     try:
         dom_context = driver.execute_script(
             "const el = arguments[0]; "
-            "const labels = el.labels ? Array.from(el.labels).map(x => x.innerText || '') : []; "
-            "const parent = el.closest('[data-testid*=resume], [class*=resume], [id*=resume], "
-            "[data-testid*=cv], [class*=cv], [id*=cv]'); "
-            "return [...labels, parent ? (parent.innerText || '') : ''].join(' ');",
+            "const text = node => (node && (node.innerText || node.textContent) || '').slice(0, 2000); "
+            "const labels = el.labels ? Array.from(el.labels).map(text) : []; "
+            "const related = (el.getAttribute('aria-labelledby') || '').split(/\\s+/) "
+            ".map(id => document.getElementById(id)).filter(Boolean).map(text); "
+            "const scopes = []; let node = el; "
+            "for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) "
+            "{ scopes.push(text(node)); } "
+            "return [...labels, ...related, ...scopes].join(' ');",
             file_input,
         )
         values.append(str(dom_context or ""))
@@ -578,17 +582,29 @@ def _upload_resume_if_present(
     *,
     pre_upload: Callable[[], None] | None = None,
     selection_callback: Callable[[], None] | None = None,
-) -> tuple[bool, bool]:
+) -> tuple[bool, bool, str]:
     inputs = driver.find_elements(By.CSS_SELECTOR, 'input[type="file"]')
     if not inputs:
-        return False, False
+        return False, False, "Dice did not expose a file input on the current Easy Apply step."
     resume_inputs = []
     for file_input in inputs:
         descriptor = _file_input_descriptor(driver, file_input)
         if _RESUME_INPUT_TERM.search(descriptor) and not _NON_RESUME_INPUT_TERM.search(descriptor):
             resume_inputs.append(file_input)
+    if not resume_inputs:
+        return (
+            True,
+            False,
+            "Dice showed file input controls, but none could be safely identified as a "
+            "resume/CV field.",
+        )
     if len(resume_inputs) != 1:
-        return True, False
+        return (
+            True,
+            False,
+            "Dice showed multiple possible resume/CV upload fields; the app did not choose "
+            "one automatically.",
+        )
     filename = os.path.basename(resume_path).lower()
     for file_input in resume_inputs:
         try:
@@ -612,12 +628,17 @@ def _upload_resume_if_present(
             WebDriverWait(driver, 12, poll_frequency=0.25).until(intended_file_selected)
             if pre_upload is not None:
                 pre_upload()
-            return True, True
+            return True, True, ""
         except ResumeTailoringError:
             raise
         except Exception:
             continue
-    return True, False
+    return (
+        True,
+        False,
+        "Dice exposed the intended resume field, but it did not accept or report the selected "
+        "filename.",
+    )
 
 
 def _confirmation_present(driver):
@@ -1239,7 +1260,7 @@ def apply_to_job_url(
                     )
                     return result
                 try:
-                    found_input, upload_succeeded = _upload_resume_if_present(
+                    found_input, upload_succeeded, upload_reason = _upload_resume_if_present(
                         driver,
                         str(prepared_path),
                         pre_upload=assert_prepared_resume_ready,
@@ -1257,7 +1278,7 @@ def apply_to_job_url(
                 if found_input and not upload_succeeded:
                     result = ApplicationResult(
                         ApplicationStatus.FAILED,
-                        "The intended resume could not be uploaded and verified.",
+                        upload_reason or "The intended resume could not be uploaded and verified.",
                         resume_profile=profile,
                         match_score=score,
                         resume_selection_attempted=resume_selection_attempted,

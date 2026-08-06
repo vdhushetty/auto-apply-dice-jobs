@@ -127,6 +127,7 @@ class WizardDriver(FakeDriver):
         has_next: bool = False,
         has_screening_control: bool = False,
         confirmed: bool = False,
+        file_input_context: str = "",
     ) -> None:
         super().__init__()
         self.apply_control = FakeElement(apply_text, enabled=apply_enabled)
@@ -139,6 +140,7 @@ class WizardDriver(FakeDriver):
         )
         self.screening_control = FakeElement() if has_screening_control else None
         self.confirmation = FakeElement("Application submitted") if confirmed else None
+        self.file_input_context = file_input_context
         self.page_source = ""
 
     def find_elements(self, by: str, selector: str) -> list[FakeElement]:
@@ -171,6 +173,8 @@ class WizardDriver(FakeDriver):
     def execute_script(self, script: str, *args: Any) -> Any:
         if "files = arguments[0].files" in script and args:
             return args[0].selected_file_name
+        if "const el = arguments[0]" in script:
+            return self.file_input_context
         if "click" in script and args:
             args[0].click()
         return None
@@ -827,8 +831,37 @@ def test_stale_page_text_cannot_verify_upload(monkeypatch, tmp_path: Path) -> No
 
     assert result.status is ApplicationStatus.FAILED
     assert result.resume_selection_attempted
-    assert "could not be uploaded" in result.reason
+    assert "did not accept or report" in result.reason
     assert driver.file_input is not None and driver.file_input.send_keys_calls == 1
+    assert not driver.submit_button.clicked
+
+
+def test_resume_picker_uses_nearby_resume_prompt_for_generic_input(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    resume = tmp_path / "aws.docx"
+    resume.touch()
+    driver = WizardDriver(
+        has_file_input=True,
+        has_next=True,
+        file_input_context="Upload your resume or CV to continue",
+    )
+    assert driver.file_input is not None
+    driver.file_input.attributes = {"name": "attachment"}
+    monkeypatch.setattr(main_script, "_extract_job_description", lambda current: "AWS " * 50)
+    monkeypatch.setattr(main_script, "WebDriverWait", ImmediateWait)
+
+    result = apply_to_job_url(
+        driver,
+        {"Job Title": "AWS Engineer", "Job URL": "https://www.dice.com/job-detail/context"},
+        PreparedService(resume),  # type: ignore[arg-type]
+        run_mode=RunMode.VERIFY_UPLOAD,
+    )
+
+    assert result.status is ApplicationStatus.UPLOAD_VERIFIED
+    assert driver.file_input.send_keys_calls == 1
+    assert not driver.next_button.clicked
     assert not driver.submit_button.clicked
 
 
