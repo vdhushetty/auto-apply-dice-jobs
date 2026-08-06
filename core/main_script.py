@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, quote, urlparse
 import pandas as pd
 from dotenv import load_dotenv
 from selenium import webdriver
+from selenium.common.exceptions import StaleElementReferenceException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
@@ -608,6 +609,20 @@ def _is_generic_dice_document_input(file_input) -> bool:
     return _GENERIC_DICE_DOCUMENT_EXTENSIONS.issubset(extensions)
 
 
+def _scoped_upload_filename_visible(driver, filename: str) -> bool:
+    """Confirm Dice's re-rendered upload state without trusting global page text."""
+
+    matching_forms = 0
+    for form in driver.find_elements(By.CSS_SELECTOR, "form"):
+        try:
+            visible_lines = str(form.text or "").splitlines()
+        except StaleElementReferenceException:
+            continue
+        if any(_browser_filename(line) == filename for line in visible_lines):
+            matching_forms += 1
+    return matching_forms == 1
+
+
 def _upload_resume_if_present(
     driver,
     resume_path: str,
@@ -626,11 +641,8 @@ def _upload_resume_if_present(
         if _RESUME_INPUT_TERM.search(descriptor) and not _NON_RESUME_INPUT_TERM.search(descriptor):
             resume_inputs.append(file_input)
     if not resume_inputs and len(inputs) == 1:
-        file_input, descriptor = input_descriptors[0]
-        if (
-            not _NON_RESUME_INPUT_TERM.search(descriptor)
-            and _is_generic_dice_document_input(file_input)
-        ):
+        file_input, _ = input_descriptors[0]
+        if _is_generic_dice_document_input(file_input):
             resume_inputs.append(file_input)
     if not resume_inputs:
         signatures = ", ".join(
@@ -660,15 +672,20 @@ def _upload_resume_if_present(
             file_input.send_keys(resume_path)
 
             def intended_file_selected(current_driver):
-                selected_name = current_driver.execute_script(
-                    "const files = arguments[0].files; "
-                    "return files && files.length ? files[0].name : '';",
-                    file_input,
-                )
-                if _browser_filename(str(selected_name or "")) == filename:
-                    return True
-                value = file_input.get_attribute("value") or ""
-                return _browser_filename(value) == filename
+                try:
+                    selected_name = current_driver.execute_script(
+                        "const files = arguments[0].files; "
+                        "return files && files.length ? files[0].name : '';",
+                        file_input,
+                    )
+                    if _browser_filename(str(selected_name or "")) == filename:
+                        return True
+                    value = file_input.get_attribute("value") or ""
+                    if _browser_filename(value) == filename:
+                        return True
+                except StaleElementReferenceException:
+                    pass
+                return _scoped_upload_filename_visible(current_driver, filename)
 
             WebDriverWait(driver, 12, poll_frequency=0.25).until(intended_file_selected)
             if pre_upload is not None:

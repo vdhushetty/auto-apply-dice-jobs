@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from selenium.common.exceptions import StaleElementReferenceException
 
 import core.main_script as main_script
 from core.authorization import DiceAuthorizationError
@@ -178,6 +179,35 @@ class WizardDriver(FakeDriver):
         if "click" in script and args:
             args[0].click()
         return None
+
+
+class ReRenderingFileInput(FakeElement):
+    def __init__(self, driver: ReRenderingWizardDriver) -> None:
+        super().__init__(attributes={"name": "resume"})
+        self.driver = driver
+
+    def send_keys(self, value: str) -> None:
+        super().send_keys(value)
+        self.driver.uploaded_filename = Path(value).name
+        self.driver.upload_rerendered = True
+
+
+class ReRenderingWizardDriver(WizardDriver):
+    def __init__(self) -> None:
+        super().__init__(has_file_input=False, has_next=True)
+        self.upload_rerendered = False
+        self.uploaded_filename = ""
+        self.file_input = ReRenderingFileInput(self)
+
+    def find_elements(self, by: str, selector: str) -> list[FakeElement]:
+        if selector == "form":
+            return [FakeElement(self.uploaded_filename)] if self.upload_rerendered else []
+        return super().find_elements(by, selector)
+
+    def execute_script(self, script: str, *args: Any) -> Any:
+        if "files = arguments[0].files" in script and self.upload_rerendered:
+            raise StaleElementReferenceException("Dice replaced the file input")
+        return super().execute_script(script, *args)
 
 
 class ImmediateWait:
@@ -890,6 +920,59 @@ def test_unique_generic_dice_document_input_is_verified_as_resume_upload(
     )
 
     assert result.status is ApplicationStatus.UPLOAD_VERIFIED
+    assert driver.file_input.send_keys_calls == 1
+    assert not driver.next_button.clicked
+    assert not driver.submit_button.clicked
+
+
+def test_unique_generic_dice_document_input_allows_shared_cover_letter_form_context(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    resume = tmp_path / "aws.docx"
+    resume.touch()
+    driver = WizardDriver(
+        has_file_input=True,
+        has_next=True,
+        file_input_context="Add a resume or cover letter document",
+    )
+    assert driver.file_input is not None
+    driver.file_input.attributes = {"accept": ".pdf,.doc,.docx,.rtf"}
+    monkeypatch.setattr(main_script, "_extract_job_description", lambda current: "AWS " * 50)
+    monkeypatch.setattr(main_script, "WebDriverWait", ImmediateWait)
+
+    result = apply_to_job_url(
+        driver,
+        {"Job Title": "AWS Engineer", "Job URL": "https://www.dice.com/job-detail/shared"},
+        PreparedService(resume),  # type: ignore[arg-type]
+        run_mode=RunMode.VERIFY_UPLOAD,
+    )
+
+    assert result.status is ApplicationStatus.UPLOAD_VERIFIED
+    assert driver.file_input.send_keys_calls == 1
+    assert not driver.next_button.clicked
+    assert not driver.submit_button.clicked
+
+
+def test_re_rendered_dice_upload_uses_scoped_filename_confirmation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    resume = tmp_path / "aws.docx"
+    resume.touch()
+    driver = ReRenderingWizardDriver()
+    monkeypatch.setattr(main_script, "_extract_job_description", lambda current: "AWS " * 50)
+    monkeypatch.setattr(main_script, "WebDriverWait", ImmediateWait)
+
+    result = apply_to_job_url(
+        driver,
+        {"Job Title": "AWS Engineer", "Job URL": "https://www.dice.com/job-detail/rerender"},
+        PreparedService(resume),  # type: ignore[arg-type]
+        run_mode=RunMode.VERIFY_UPLOAD,
+    )
+
+    assert result.status is ApplicationStatus.UPLOAD_VERIFIED
+    assert result.resume_filename == "aws.docx"
     assert driver.file_input.send_keys_calls == 1
     assert not driver.next_button.clicked
     assert not driver.submit_button.clicked
