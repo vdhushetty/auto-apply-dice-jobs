@@ -103,3 +103,57 @@ def test_role_run_restarts_browser_and_continues_with_next_result(
     ]
     assert all(driver.quit_called for driver in created_drivers)
     assert any(event.get("stage") == "recovering_browser" for event in events)
+
+
+def test_role_run_finishes_current_results_page_before_loading_next_page(
+    monkeypatch, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    class Driver:
+        def quit(self) -> None:
+            pass
+
+    sequence: list[str] = []
+    monkeypatch.setenv("DICE_USERNAME", "candidate@example.com")
+    monkeypatch.setenv("DICE_PASSWORD", "not-a-real-password")
+    monkeypatch.setattr(role_ordered, "load_dotenv", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        role_ordered,
+        "_load_settings",
+        lambda: {
+            "search_queries": ["Data Engineer"],
+            "include_keywords": [],
+            "exclude_keywords": [],
+        },
+    )
+    monkeypatch.setattr(
+        role_ordered.ResumeService,
+        "from_settings",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(role_ordered, "get_web_driver", lambda **kwargs: Driver())
+    monkeypatch.setattr(role_ordered, "authenticate_dice_session", lambda *args: (True, ""))
+
+    def fetch(_driver, _query, *_args, **kwargs):
+        page = kwargs["start_page"]
+        sequence.append(f"fetch:{page}")
+        return (
+            [
+                {
+                    "Job Title": f"Page {page}",
+                    "Job URL": f"https://www.dice.com/job-detail/page-{page}",
+                }
+            ],
+            [],
+        )
+
+    def apply(_driver, job, _service, **_kwargs):
+        sequence.append(f"apply:{job['Job Title']}")
+        if job["Job Title"] == "Page 1":
+            return ApplicationResult(ApplicationStatus.SKIPPED, "No Easy Apply")
+        return ApplicationResult(ApplicationStatus.APPLIED, "Dice confirmed submission.")
+
+    monkeypatch.setattr(role_ordered, "fetch_jobs_with_requests", fetch)
+    monkeypatch.setattr(role_ordered, "apply_to_job_url", apply)
+
+    assert role_ordered.run(1, skip_review=True, ledger_path=tmp_path / "ledger.jsonl") == 1
+    assert sequence == ["fetch:1", "apply:Page 1", "fetch:2", "apply:Page 2"]

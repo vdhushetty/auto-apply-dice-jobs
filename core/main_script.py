@@ -1683,6 +1683,7 @@ def fetch_jobs_with_requests(
     *,
     max_pages=None,
     max_included_jobs=None,
+    start_page=1,
 ):
     """
     Use the existing browser instance to fetch job listings.
@@ -1692,6 +1693,8 @@ def fetch_jobs_with_requests(
         raise ValueError("max_pages must be at least 1 when provided.")
     if max_included_jobs is not None and max_included_jobs < 1:
         raise ValueError("max_included_jobs must be at least 1 when provided.")
+    if start_page < 1:
+        raise ValueError("start_page must be at least 1.")
     print(f"Fetching jobs for query: {search_query}")
 
     # Format search parameters for URL
@@ -1782,7 +1785,7 @@ def fetch_jobs_with_requests(
                 total_pages = min(total_pages, max_pages)
 
         # Process each page
-        for page in range(1, total_pages + 1):
+        for page in range(start_page, total_pages + 1):
             current_url = base_url if page == 1 else f"{base_url}&page={page}"
             print(f"Processing page {page}/{total_pages}: {current_url}")
 

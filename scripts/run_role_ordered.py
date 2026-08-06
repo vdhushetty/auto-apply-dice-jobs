@@ -30,7 +30,7 @@ from core.main_script import (
 from core.resumes import ResumeService
 
 LEDGER_PATH = Path(".data/role_ordered_runs/ledger.jsonl")
-_CANDIDATE_POOL_MULTIPLIER = 4
+_MAX_SEARCH_RESULT_PAGES = 2
 
 
 def _load_settings() -> dict[str, Any]:
@@ -149,83 +149,100 @@ def run(
             if cancel_requested is not None and cancel_requested():
                 break
             role_submitted = 0
-            jobs, _ = fetch_jobs_with_requests(
-                driver,
-                query,
-                settings.get("include_keywords"),
-                settings.get("exclude_keywords"),
-                max_pages=2,
-                max_included_jobs=limit * _CANDIDATE_POOL_MULTIPLIER,
-            )
-            fresh_jobs = []
-            for job in jobs:
-                url = str(job.get("Job URL", ""))
-                if url and url not in seen_urls:
-                    seen_urls.add(url)
-                    job["Search Query"] = query
-                    fresh_jobs.append(job)
-            for position, job in enumerate(fresh_jobs, start=1):
+            for page in range(1, _MAX_SEARCH_RESULT_PAGES + 1):
                 if cancel_requested is not None and cancel_requested():
                     break
                 if role_submitted >= limit:
                     break
-
                 if event_callback is not None:
                     event_callback(
                         {
                             "kind": "progress",
-                            "stage": "starting_search_result",
-                            "job_title": str(job.get("Job Title", "")),
+                            "stage": "loading_search_results",
+                            "job_title": query,
                             "reason": (
-                                f"Data from search result {position}/{len(fresh_jobs)}: "
-                                "opening this job before moving to the next result."
+                                f"Loading {query} search-results page {page}; applications on this "
+                                "page finish before another page is opened."
                             ),
                         }
                     )
-
-                def progress(event):
-                    if event_callback is not None:
-                        event_callback(
-                            {
-                                "kind": "progress",
-                                "stage": event.stage.value,
-                                "job_title": event.job_title,
-                                "reason": event.message,
-                            }
-                        )
-
-                result = apply_to_job_url(
+                jobs, _ = fetch_jobs_with_requests(
                     driver,
-                    job,
-                    service,
-                    run_mode=RunMode.SUBMIT,
-                    cancel_requested=cancel_requested,
-                    progress_callback=progress,
+                    query,
+                    settings.get("include_keywords"),
+                    settings.get("exclude_keywords"),
+                    max_pages=page,
+                    start_page=page,
                 )
-                entry = _outcome_entry(query, job, result)
-                _append_ledger(ledger_path, entry)
-                print(json.dumps(entry, ensure_ascii=False), flush=True)
-                if event_callback is not None:
-                    event_callback(entry)
-                if result.status is ApplicationStatus.APPLIED:
-                    submitted += 1
-                    role_submitted += 1
-                if _browser_session_lost(result.reason):
+                fresh_jobs = []
+                for job in jobs:
+                    url = str(job.get("Job URL", ""))
+                    if url and url not in seen_urls:
+                        seen_urls.add(url)
+                        job["Search Query"] = query
+                        fresh_jobs.append(job)
+                for position, job in enumerate(fresh_jobs, start=1):
+                    if cancel_requested is not None and cancel_requested():
+                        break
+                    if role_submitted >= limit:
+                        break
+
                     if event_callback is not None:
                         event_callback(
                             {
                                 "kind": "progress",
-                                "stage": "recovering_browser",
+                                "stage": "starting_search_result",
                                 "job_title": str(job.get("Job Title", "")),
                                 "reason": (
-                                    "Dice's browser session closed. Restarting it and continuing "
-                                    "with the next search result."
+                                    f"Search-results page {page}, result {position}/{len(fresh_jobs)}: "
+                                    "opening this job before moving to the next result."
                                 ),
                             }
                         )
-                    with suppress(Exception):
-                        driver.quit()
-                    driver = _authenticated_driver(username, password)
+
+                    def progress(event):
+                        if event_callback is not None:
+                            event_callback(
+                                {
+                                    "kind": "progress",
+                                    "stage": event.stage.value,
+                                    "job_title": event.job_title,
+                                    "reason": event.message,
+                                }
+                            )
+
+                    result = apply_to_job_url(
+                        driver,
+                        job,
+                        service,
+                        run_mode=RunMode.SUBMIT,
+                        cancel_requested=cancel_requested,
+                        progress_callback=progress,
+                    )
+                    entry = _outcome_entry(query, job, result)
+                    _append_ledger(ledger_path, entry)
+                    print(json.dumps(entry, ensure_ascii=False), flush=True)
+                    if event_callback is not None:
+                        event_callback(entry)
+                    if result.status is ApplicationStatus.APPLIED:
+                        submitted += 1
+                        role_submitted += 1
+                    if _browser_session_lost(result.reason):
+                        if event_callback is not None:
+                            event_callback(
+                                {
+                                    "kind": "progress",
+                                    "stage": "recovering_browser",
+                                    "job_title": str(job.get("Job Title", "")),
+                                    "reason": (
+                                        "Dice's browser session closed. Restarting it and continuing "
+                                        "with the next search result."
+                                    ),
+                                }
+                            )
+                        with suppress(Exception):
+                            driver.quit()
+                        driver = _authenticated_driver(username, password)
     finally:
         driver.quit()
     print(json.dumps({"submitted": submitted, "per_role_cap": limit}), flush=True)
