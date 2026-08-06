@@ -2290,20 +2290,28 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
         counts = Counter()
 
         def record(entry):
-            status = str(entry.get("status", "failed"))
             title = _safe_ui_message(entry.get("job_title", "Unknown"), 120)
+            reason = _safe_ui_message(entry.get("reason", ""), 160)
+            if entry.get("kind") == "progress":
+                stage = str(entry.get("stage", "progress")).replace("_", " ")
+                self.update_status(f"{stage.title()}: {title} — {reason}")
+                return
+            status = str(entry.get("status", "failed"))
             counts[status] += 1
-            self.update_status(f"Role-ordered run: {status.replace('_', ' ')} — {title}")
+            self.update_status(f"Role-ordered run: {status.replace('_', ' ')} — {title}. {reason}")
             if status == ApplicationStatus.APPLIED.value:
                 self.post_ui(
                     lambda count=counts[status]: self.jobs_applied_label.config(text=str(count))
                 )
-            elif status in {
-                ApplicationStatus.SKIPPED.value,
-                ApplicationStatus.ALREADY_APPLIED.value,
-            }:
+            elif status == ApplicationStatus.SKIPPED.value:
                 self.post_ui(
                     lambda count=counts[status]: self.jobs_skipped_label.config(text=str(count))
+                )
+            elif status == ApplicationStatus.ALREADY_APPLIED.value:
+                self.post_ui(
+                    lambda count=counts[status]: self.jobs_already_applied_label.config(
+                        text=str(count)
+                    )
                 )
             elif status == ApplicationStatus.FAILED.value:
                 self.post_ui(

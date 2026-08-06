@@ -93,9 +93,10 @@ confirmation element.
 
 Dice occasionally renders an unlabeled file input in the initial Easy Apply wizard. The browser
 accepts it as the resume field only when it is the sole file input and its `accept` contract
-includes PDF, DOC, DOCX, and RTF. This accommodates Dice's combined resume/cover-letter form
-without choosing among multiple file controls. The exact selected filename is still required
-before advancing or submitting.
+includes PDF, DOC, DOCX, and RTF, and no related context refers to a cover letter or another
+non-resume attachment. A shared resume/cover-letter picker is ambiguous and must not receive a
+resume automatically. The exact selected filename is still required before advancing or
+submitting.
 The requested job-detail path, canonical structured-data URL, post-navigation path, and Easy Apply
 job identifier must agree. File selection requires exactly one resume/CV-labelled input or the
 narrowed Dice document-picker contract above; ambiguous or unrelated attachment fields fail

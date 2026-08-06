@@ -58,6 +58,7 @@ class FakeElement:
         displayed: bool = True,
         accepts_file: bool = True,
         attributes: dict[str, str] | None = None,
+        on_click=None,
     ) -> None:
         self.text = text
         self.href = href
@@ -69,6 +70,7 @@ class FakeElement:
         self.selected_file_name = ""
         self.send_keys_calls = 0
         self.attributes = attributes or {}
+        self.on_click = on_click
 
     def is_displayed(self) -> bool:
         return self.displayed
@@ -85,6 +87,8 @@ class FakeElement:
 
     def click(self) -> None:
         self.clicked = True
+        if self.on_click is not None:
+            self.on_click()
 
     def send_keys(self, value: str) -> None:
         self.send_keys_calls += 1
@@ -207,6 +211,43 @@ class ReRenderingWizardDriver(WizardDriver):
     def execute_script(self, script: str, *args: Any) -> Any:
         if "files = arguments[0].files" in script and self.upload_rerendered:
             raise StaleElementReferenceException("Dice replaced the file input")
+        return super().execute_script(script, *args)
+
+
+class ResumeReplacementWizardDriver(WizardDriver):
+    """Models Dice's two File options menus and its Resume-only Replace action."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            has_file_input=True,
+            has_next=True,
+            file_input_context="Cover letter Optional Upload your cover letter",
+        )
+        assert self.file_input is not None
+        self.file_input.attributes = {"accept": ".pdf,.doc,.docx,.rtf,.txt"}
+        self.replacement_menu_open = False
+        self.resume_file_options = FakeElement(on_click=self._open_replacement_menu)
+        self.cover_letter_file_options = FakeElement()
+        self.replace_option = FakeElement("Replace", on_click=self._replace_resume)
+
+    def _open_replacement_menu(self) -> None:
+        self.replacement_menu_open = True
+
+    def _replace_resume(self) -> None:
+        self.file_input_context = (
+            "Resume & Cover Letter Resume Upload your resume Cover letter Optional"
+        )
+
+    def find_elements(self, by: str, selector: str) -> list[FakeElement]:
+        if selector == 'button[aria-label="File options"]':
+            return [self.resume_file_options, self.cover_letter_file_options]
+        if selector == '[role="menuitem"]':
+            return [self.replace_option] if self.replacement_menu_open else []
+        return super().find_elements(by, selector)
+
+    def execute_script(self, script: str, *args: Any) -> Any:
+        if "const firstLine" in script:
+            return bool(args and args[0] is self.resume_file_options)
         return super().execute_script(script, *args)
 
 
@@ -925,7 +966,7 @@ def test_unique_generic_dice_document_input_is_verified_as_resume_upload(
     assert not driver.submit_button.clicked
 
 
-def test_unique_generic_dice_document_input_allows_shared_cover_letter_form_context(
+def test_generic_document_input_with_cover_letter_context_stays_unselected(
     monkeypatch,
     tmp_path: Path,
 ) -> None:  # type: ignore[no-untyped-def]
@@ -948,8 +989,35 @@ def test_unique_generic_dice_document_input_allows_shared_cover_letter_form_cont
         run_mode=RunMode.VERIFY_UPLOAD,
     )
 
+    assert result.status is ApplicationStatus.FAILED
+    assert "none could be safely identified" in result.reason
+    assert driver.file_input.send_keys_calls == 0
+    assert not driver.next_button.clicked
+    assert not driver.submit_button.clicked
+
+
+def test_dice_resume_replacement_uses_resume_file_options_not_cover_letter(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    resume = tmp_path / "tailored-aws.docx"
+    resume.touch()
+    driver = ResumeReplacementWizardDriver()
+    monkeypatch.setattr(main_script, "_extract_job_description", lambda current: "AWS " * 50)
+    monkeypatch.setattr(main_script, "WebDriverWait", ImmediateWait)
+
+    result = apply_to_job_url(
+        driver,
+        {"Job Title": "AWS Engineer", "Job URL": "https://www.dice.com/job-detail/replacement"},
+        PreparedService(resume),  # type: ignore[arg-type]
+        run_mode=RunMode.VERIFY_UPLOAD,
+    )
+
     assert result.status is ApplicationStatus.UPLOAD_VERIFIED
-    assert driver.file_input.send_keys_calls == 1
+    assert driver.resume_file_options.clicked
+    assert not driver.cover_letter_file_options.clicked
+    assert driver.replace_option.clicked
+    assert driver.file_input is not None and driver.file_input.send_keys_calls == 1
     assert not driver.next_button.clicked
     assert not driver.submit_button.clicked
 

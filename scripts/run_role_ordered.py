@@ -146,12 +146,25 @@ def run(
                     break
                 if role_submitted >= limit:
                     break
+
+                def progress(event):
+                    if event_callback is not None:
+                        event_callback(
+                            {
+                                "kind": "progress",
+                                "stage": event.stage.value,
+                                "job_title": event.job_title,
+                                "reason": event.message,
+                            }
+                        )
+
                 result = apply_to_job_url(
                     driver,
                     job,
                     service,
                     run_mode=RunMode.SUBMIT,
                     cancel_requested=cancel_requested,
+                    progress_callback=progress,
                 )
                 entry = _outcome_entry(query, job, result)
                 _append_ledger(ledger_path, entry)

@@ -492,9 +492,7 @@ def _is_expected_dice_apply_target(candidate_url: str, job_url: str) -> bool:
     redirect_path = redirect_values[0]
     if not redirect_path.startswith("/") or redirect_path.startswith("//"):
         return False
-    return _is_expected_dice_application_url(
-        f"https://www.dice.com{redirect_path}", job_url
-    )
+    return _is_expected_dice_application_url(f"https://www.dice.com{redirect_path}", job_url)
 
 
 def _is_expected_apply_context(current_url: str, job_url: str) -> bool:
@@ -609,6 +607,65 @@ def _is_generic_dice_document_input(file_input) -> bool:
     return _GENERIC_DICE_DOCUMENT_EXTENSIONS.issubset(extensions)
 
 
+def _open_dice_resume_replace_picker(driver) -> tuple[bool, str]:
+    """Open Dice's Resume-only replacement picker, never the cover-letter one.
+
+    Dice's current Easy Apply form represents an existing resume and cover letter as
+    separate cards, each with an identically labelled ``File options`` button.  The
+    file input is only created after selecting ``Replace``.  Select the button whose
+    *nearest card* starts with ``Resume``; do not infer from the enclosing form,
+    because that form intentionally contains both fields.
+    """
+
+    controls = driver.find_elements(By.CSS_SELECTOR, 'button[aria-label="File options"]')
+    resume_controls = []
+    for control in controls:
+        try:
+            is_resume_card = driver.execute_script(
+                "const button = arguments[0]; let node = button.parentElement; "
+                "for (let depth = 0; node && depth < 4; depth += 1, node = node.parentElement) { "
+                "const lines = (node.innerText || node.textContent || '').split(/\\n+/) "
+                ".map(value => value.trim()).filter(Boolean); "
+                "const firstLine = lines[0] || ''; "
+                "if (/^resume(?:\\s|\\*|$)/i.test(firstLine)) return true; "
+                "if (/^cover\\s*letter(?:\\s|\\*|$)/i.test(firstLine)) return false; "
+                "} return false;",
+                control,
+            )
+        except Exception:
+            continue
+        if is_resume_card:
+            resume_controls.append(control)
+    if not resume_controls:
+        return (
+            False,
+            "Dice did not expose a Resume-only replacement control on this Easy Apply step.",
+        )
+    if len(resume_controls) != 1:
+        return (
+            False,
+            "Dice exposed multiple Resume replacement controls; the app did not choose one automatically.",
+        )
+    try:
+        resume_controls[0].click()
+
+        def replace_option_visible(current_driver):
+            return next(
+                (
+                    item
+                    for item in current_driver.find_elements(By.CSS_SELECTOR, '[role="menuitem"]')
+                    if item.is_displayed() and (item.text or "").strip().casefold() == "replace"
+                ),
+                False,
+            )
+
+        replace_option = WebDriverWait(driver, 4, poll_frequency=0.2).until(replace_option_visible)
+        replace_option.click()
+        return True, ""
+    except Exception:
+        return False, "Dice did not open the Resume replacement picker."
+
+
 def _scoped_upload_filename_visible(driver, filename: str) -> bool:
     """Confirm Dice's re-rendered upload state without trusting global page text."""
 
@@ -631,8 +688,6 @@ def _upload_resume_if_present(
     selection_callback: Callable[[], None] | None = None,
 ) -> tuple[bool, bool, str]:
     inputs = driver.find_elements(By.CSS_SELECTOR, 'input[type="file"]')
-    if not inputs:
-        return False, False, "Dice did not expose a file input on the current Easy Apply step."
     input_descriptors: list[tuple[Any, str]] = []
     resume_inputs = []
     for file_input in inputs:
@@ -641,9 +696,37 @@ def _upload_resume_if_present(
         if _RESUME_INPUT_TERM.search(descriptor) and not _NON_RESUME_INPUT_TERM.search(descriptor):
             resume_inputs.append(file_input)
     if not resume_inputs and len(inputs) == 1:
-        file_input, _ = input_descriptors[0]
-        if _is_generic_dice_document_input(file_input):
+        file_input, descriptor = input_descriptors[0]
+        if not _NON_RESUME_INPUT_TERM.search(descriptor) and _is_generic_dice_document_input(
+            file_input
+        ):
             resume_inputs.append(file_input)
+    if not resume_inputs:
+        replacement_opened, replacement_reason = _open_dice_resume_replace_picker(driver)
+        if replacement_opened:
+            inputs = driver.find_elements(By.CSS_SELECTOR, 'input[type="file"]')
+            input_descriptors = []
+            resume_inputs = []
+            for file_input in inputs:
+                descriptor = _file_input_descriptor(driver, file_input)
+                input_descriptors.append((file_input, descriptor))
+                if _RESUME_INPUT_TERM.search(descriptor) and not _NON_RESUME_INPUT_TERM.search(
+                    descriptor
+                ):
+                    resume_inputs.append(file_input)
+            # The replacement picker was opened through the Resume card's own
+            # File options → Replace menu. Dice renders that picker inside the
+            # combined Resume & Cover Letter form, so its ancestor text includes
+            # "Cover letter" even though the only input was created for Resume.
+            # Its narrow document contract is safe only after that exact action.
+            if (
+                not resume_inputs
+                and len(inputs) == 1
+                and _is_generic_dice_document_input(inputs[0])
+            ):
+                resume_inputs.append(inputs[0])
+        elif not inputs:
+            return False, False, replacement_reason
     if not resume_inputs:
         signatures = ", ".join(
             _file_input_signature(file_input, position)
@@ -1222,9 +1305,7 @@ def apply_to_job_url(
             resume_kind = "generated" if preparation.prepared.tailored else "selected"
         if isinstance(job, dict):
             job["Tailored Resume"] = bool(preparation.prepared.tailored)
-            job["Verification Resume Fallback"] = bool(
-                preparation.prepared.verification_fallback
-            )
+            job["Verification Resume Fallback"] = bool(preparation.prepared.verification_fallback)
         _emit_application_progress(
             progress_callback,
             ApplicationProgressStage.RESUME_READY,
