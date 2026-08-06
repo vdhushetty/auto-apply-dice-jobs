@@ -3,6 +3,7 @@
 import os
 import queue
 import sys
+import hashlib
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 import threading
@@ -11,11 +12,21 @@ import pandas as pd
 from datetime import datetime
 import time
 import logging
+import re
 import subprocess
+from collections import Counter
 
 from core.authorization import DiceAuthorizationError, require_dice_automation_authorized
-from core.dice_login import login_to_dice, update_dice_credentials, validate_dice_credentials
+from core.dice_login import (
+    authenticate_dice_session,
+    get_dice_session_cookies,
+    normalize_dice_session_cookies,
+    update_dice_credentials,
+    validate_dice_credentials,
+)
 from core.main_script import (
+    ApplicationProgress,
+    ApplicationProgressStage,
     ApplicationStatus,
     RunMode,
     apply_to_job_url,
@@ -34,6 +45,126 @@ AI_REVIEW_POLICY_LABELS = {
     "skip_review": "Skip review",
 }
 AI_REVIEW_POLICY_VALUES = {label: value for value, label in AI_REVIEW_POLICY_LABELS.items()}
+_SECRET_LIKE_TOKEN = re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}\b", re.IGNORECASE)
+_LOCAL_PATH = re.compile(
+    r"(?<!:)/(?:Users|home|tmp|private|var)/[^,;\n]+|[A-Za-z]:\\[^,;\n]+"
+)
+
+
+def _safe_ui_message(value, max_chars=240):
+    compact = " ".join(str(value or "").split())
+    compact = _SECRET_LIKE_TOKEN.sub("[redacted token]", compact)
+    compact = _LOCAL_PATH.sub("[local path]", compact)
+    return compact if len(compact) <= max_chars else f"{compact[: max_chars - 1]}…"
+
+
+def _credential_fingerprint(username, password):
+    """Identify the exact tested credential pair without retaining another plaintext copy."""
+
+    material = f"{username}\0{password}".encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def _application_progress_view(event: ApplicationProgress, current, total):
+    """Build bounded UI strings from an already-sanitized application event."""
+
+    job_position = f"{current}/{total}" if total else str(current)
+    job_text = f"{job_position} — {event.job_title or 'Unknown job'}"
+    stage_text = event.stage.value.replace("_", " ").title()
+    step_text = f"{stage_text}: {event.message}"
+    resume_parts = []
+    if event.resume_kind:
+        resume_parts.append(event.resume_kind.title())
+    if event.resume_profile:
+        resume_parts.append(event.resume_profile.upper())
+    if event.resume_filename:
+        resume_parts.append(event.resume_filename)
+    resume_text = " — ".join(resume_parts) if resume_parts else "Pending"
+    last_result = None
+    if event.stage is ApplicationProgressStage.RESUME_SELECTED:
+        last_result = f"Resume selected — filename verified: {event.resume_filename}"
+    elif event.stage is ApplicationProgressStage.SUBMISSION_CONFIRMED:
+        last_result = "Submission confirmed by Dice"
+    elif event.stage is ApplicationProgressStage.COMPLETED:
+        status = (event.status or "completed").replace("_", " ").title()
+        last_result = f"{status}: {event.message}"
+    return job_text, step_text, resume_text, last_result
+
+
+def _run_stop_summary(
+    reason,
+    *,
+    processed,
+    total,
+    applied,
+    ready,
+    already_applied,
+    skipped,
+    failed,
+):
+    reason = _safe_ui_message(reason, 120)
+    return (
+        f"Stopped: {reason}. Processed {processed}/{total}; Applied: {applied}, "
+        f"Ready/verified: {ready}, Already applied: {already_applied}, "
+        f"Skipped: {skipped}, Failed: {failed}."
+    )
+
+
+def _run_completion_summary(
+    *,
+    selected_jobs,
+    applied,
+    ready,
+    already_applied,
+    skipped,
+    failed,
+    elapsed,
+    top_preflight_reason="",
+    verify_upload=False,
+    last_attempt_reason="",
+):
+    if selected_jobs and (not verify_upload or ready):
+        lead = "Run completed."
+    elif selected_jobs:
+        lead = "No upload was verified."
+        if last_attempt_reason:
+            lead += f" Last reason: {_safe_ui_message(last_attempt_reason)}"
+    else:
+        lead = "No eligible job reached upload."
+        if top_preflight_reason:
+            lead += f" Top reason: {_safe_ui_message(top_preflight_reason)}"
+    return (
+        f"{lead} Applied: {applied}, Ready/verified: {ready}, "
+        f"Already applied: {already_applied}, Skipped: {skipped}, "
+        f"Failed: {failed}, Time: {elapsed}"
+    )
+
+
+def _preflight_rejection_counts(rejected_jobs):
+    return Counter(
+        str(job.get("Application Reason", "Unspecified preflight rejection"))
+        for job in rejected_jobs
+    )
+
+
+def _discovered_prior_applications(all_jobs, applied_urls):
+    """Return only jobs discovered in this run that exist in the local ledger."""
+
+    return [dict(job) for url, job in all_jobs.items() if url in applied_urls]
+
+
+def _ranked_jobs_for_run(selection, run_mode):
+    """Keep Verify Upload to the single highest-ranked selected job."""
+
+    selected = list(selection.selected_jobs)
+    if run_mode is RunMode.VERIFY_UPLOAD:
+        selected = selected[:1]
+        for job in selected:
+            job["Selection Status"] = "verify_candidate"
+            job["Selection Reason"] = (
+                "Highest-ranked eligible candidate for the one-job upload verification run."
+            )
+    return selected
 
 
 class DiceAutoBotApp:
@@ -63,6 +194,8 @@ class DiceAutoBotApp:
         self.driver = None
         self.job_thread = None
         self.login_test_thread = None
+        self.verified_credentials_fingerprint = None
+        self.login_session_cookies = ()
         self.running = False
 
         # Load configuration if exists
@@ -390,7 +523,7 @@ class DiceAutoBotApp:
 
         # Status label
         self.status_label = ttk.Label(progress_frame, text="Ready to start.")
-        self.status_label.pack(padx=10, pady=5)
+        self.status_label.pack(fill="x", padx=10, pady=5)
 
         # Progress bar
         self.progress_bar = ttk.Progressbar(progress_frame, mode="determinate")
@@ -435,6 +568,54 @@ class DiceAutoBotApp:
         ttk.Label(stats_frame, text="Already Applied:").grid(row=1, column=2, padx=5, pady=5)
         self.jobs_already_applied_label = ttk.Label(stats_frame, text="0")
         self.jobs_already_applied_label.grid(row=1, column=3, padx=5, pady=5)
+
+        activity_frame = ttk.LabelFrame(progress_frame, text="Live Automation")
+        activity_frame.pack(fill="x", padx=10, pady=(2, 6))
+        activity_frame.columnconfigure(1, weight=1)
+        ttk.Label(activity_frame, text="Current job:").grid(
+            row=0, column=0, sticky="nw", padx=5, pady=2
+        )
+        self.current_job_label = ttk.Label(
+            activity_frame,
+            text="Not started",
+            anchor="w",
+            justify="left",
+            wraplength=720,
+        )
+        self.current_job_label.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
+        ttk.Label(activity_frame, text="Current step:").grid(
+            row=1, column=0, sticky="nw", padx=5, pady=2
+        )
+        self.current_step_label = ttk.Label(
+            activity_frame,
+            text="Waiting",
+            anchor="w",
+            justify="left",
+            wraplength=720,
+        )
+        self.current_step_label.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
+        ttk.Label(activity_frame, text="Resume:").grid(
+            row=2, column=0, sticky="nw", padx=5, pady=2
+        )
+        self.current_resume_label = ttk.Label(
+            activity_frame,
+            text="Pending",
+            anchor="w",
+            justify="left",
+            wraplength=720,
+        )
+        self.current_resume_label.grid(row=2, column=1, sticky="ew", padx=5, pady=2)
+        ttk.Label(activity_frame, text="Last result:").grid(
+            row=3, column=0, sticky="nw", padx=5, pady=2
+        )
+        self.last_result_label = ttk.Label(
+            activity_frame,
+            text="None",
+            anchor="w",
+            justify="left",
+            wraplength=720,
+        )
+        self.last_result_label.grid(row=3, column=1, sticky="ew", padx=5, pady=2)
 
         # Excel Files section
         excel_frame = ttk.LabelFrame(self.main_tab, text="Excel Files")
@@ -551,6 +732,13 @@ class DiceAutoBotApp:
         # Test login button
         self.test_login_button = ttk.Button(login_frame, text="Test Login", command=self.test_login)
         self.test_login_button.pack(pady=10)
+        self.login_status_label = ttk.Label(
+            login_frame,
+            text="Not tested — Test Login opens a temporary browser session.",
+        )
+        self.login_status_label.pack(pady=(0, 10))
+        self.username_entry.bind("<KeyRelease>", self.on_credentials_changed)
+        self.password_entry.bind("<KeyRelease>", self.on_credentials_changed)
 
         # Application settings
         settings_frame = ttk.LabelFrame(self.settings_tab, text="Application Settings")
@@ -766,7 +954,7 @@ How to Use This Application
 4. Configure either three cloud resumes or one base DOCX for AI bullet tailoring
 5. For AI bullet mode, choose Review before apply or Skip review before starting
 6. Run Preview first; it never clicks Apply
-7. Use Verify Upload for one supervised filename check; Dice may retain a draft
+7. Verify Upload checks one highest-ranked match and stops before Next or Submit
 8. Use Submit only after reviewing preview results
 
 Understanding Keywords
@@ -816,8 +1004,8 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             ),
             RunMode.VERIFY_UPLOAD: (
                 "Verify One Upload",
-                "Upload verification is limited to one job and never clicks Next or Submit; "
-                "Dice may retain a draft.",
+                "Checks one highest-ranked eligible job, verifies at most one resume selection, "
+                "and never clicks Next or Submit; Dice may retain one draft.",
             ),
             RunMode.SUBMIT: (
                 "Start Submitting",
@@ -1091,6 +1279,45 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             self.logger.error(f"Error loading log file: {e}")
             messagebox.showerror("Error", f"Failed to load log file: {str(e)}")
 
+    def on_credentials_changed(self, _event=None):
+        """Invalidate a tested session as soon as either credential field changes."""
+
+        if self.verified_credentials_fingerprint is None:
+            return
+        username = self.username_entry.get().strip()
+        password = self.password_entry.get().strip()
+        if _credential_fingerprint(username, password) == self.verified_credentials_fingerprint:
+            return
+        self.verified_credentials_fingerprint = None
+        self.login_session_cookies = ()
+        self.test_login_button.config(text="Test Login")
+        self.login_status_label.config(text="Credentials changed — test this login again.")
+
+    def _remember_verified_login(self, credential_fingerprint, session_cookies):
+        """Keep a verified Dice session in memory only for the exact current credentials."""
+
+        current_fingerprint = _credential_fingerprint(
+            self.username_entry.get().strip(),
+            self.password_entry.get().strip(),
+        )
+        if credential_fingerprint != current_fingerprint:
+            self.verified_credentials_fingerprint = None
+            self.login_session_cookies = ()
+            self.test_login_button.config(text="Test Login")
+            self.login_status_label.config(
+                text="Credentials changed while signing in — test the current values again."
+            )
+            return False
+        self.verified_credentials_fingerprint = credential_fingerprint
+        self.login_session_cookies = normalize_dice_session_cookies(session_cookies)
+        self.test_login_button.config(text="Test Again")
+        if self.login_session_cookies:
+            status = "✓ Credentials and Dice session verified for this app session."
+        else:
+            status = "✓ Credentials verified; the automation will sign in when it starts."
+        self.login_status_label.config(text=status)
+        return True
+
     def test_login(self):
         """Test Dice login credentials"""
         if self.login_test_thread is not None and self.login_test_thread.is_alive():
@@ -1112,6 +1339,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
 
         # Disable button during testing
         self.test_login_button.config(state="disabled", text="Testing...")
+        self.login_status_label.config(text="Testing credentials in a temporary browser...")
         self.root.update_idletasks()
         result_queue = queue.Queue(maxsize=1)
         deadline = time.monotonic() + 100
@@ -1121,7 +1349,9 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
         def poll_login_result():
             nonlocal last_elapsed
             try:
-                success, error_message = result_queue.get_nowait()
+                success, error_message, credential_fingerprint, session_cookies = (
+                    result_queue.get_nowait()
+                )
             except queue.Empty:
                 if time.monotonic() >= deadline:
                     self.test_login_complete(
@@ -1136,22 +1366,36 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                     last_elapsed = elapsed
                 self.root.after(100, poll_login_result)
                 return
-            self.test_login_complete(success, error_message)
+            self.test_login_complete(
+                success,
+                error_message,
+                credential_fingerprint=credential_fingerprint,
+                session_cookies=session_cookies,
+            )
 
         def test_login_thread():
             try:
                 failure_messages = []
+                captured_session_cookies = []
                 success = validate_dice_credentials(
                     username,
                     password,
                     headless=headless,
                     failure_callback=failure_messages.append,
+                    session_callback=captured_session_cookies.extend,
                 )
                 error_message = failure_messages[-1] if failure_messages else None
-                result_queue.put((success, error_message))
+                result_queue.put(
+                    (
+                        success,
+                        error_message,
+                        _credential_fingerprint(username, password),
+                        tuple(captured_session_cookies),
+                    )
+                )
 
             except Exception as e:
-                result_queue.put((False, str(e)))
+                result_queue.put((False, str(e), _credential_fingerprint(username, password), ()))
 
         # Run the test in a separate thread
         self.login_test_thread = threading.Thread(
@@ -1161,16 +1405,41 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
         self.login_test_thread.start()
         self.root.after(100, poll_login_result)
 
-    def test_login_complete(self, success, error_msg=None):
+    def test_login_complete(
+        self,
+        success,
+        error_msg=None,
+        *,
+        credential_fingerprint=None,
+        session_cookies=(),
+    ):
         """Handle login test completion"""
         # Re-enable the button
         self.test_login_button.config(state="normal", text="Test Login")
 
         if success:
+            remembered = self._remember_verified_login(
+                credential_fingerprint,
+                session_cookies,
+            )
+            if not remembered:
+                messagebox.showwarning(
+                    "Login Test",
+                    "Login succeeded for the previous values, but the credentials changed. "
+                    "Test the current values again.",
+                )
+                return
             self.logger.info("Login test successful")
-            messagebox.showinfo("Login Test", "Login successful!")
+            messagebox.showinfo(
+                "Login Test",
+                "Login successful. The verified session will be reused when possible; "
+                "if Dice expires it, the run will sign in again automatically.",
+            )
         else:
-            error = (
+            self.verified_credentials_fingerprint = None
+            self.login_session_cookies = ()
+            self.login_status_label.config(text="Login not verified — check the message and retry.")
+            error = _safe_ui_message(
                 error_msg
                 if error_msg
                 else "Dice did not confirm the login. Check credentials or retry without headless mode."
@@ -1180,6 +1449,14 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
 
     def start_applying(self):
         """Start the job application process"""
+        if self.login_test_thread is not None and self.login_test_thread.is_alive():
+            messagebox.showinfo(
+                "Login Test Running",
+                "Wait for Test Login to finish and show the verified status before starting.",
+            )
+            self.notebook.select(1)
+            return
+
         # Validate inputs
         search_queries = [q.strip() for q in self.search_query_entry.get().split(",") if q.strip()]
         if not search_queries:
@@ -1275,8 +1552,9 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             ),
             RunMode.VERIFY_UPLOAD: (
                 "Confirm One Upload Check",
-                "Open one eligible Easy Apply wizard and verify the selected resume filename. "
-                "Next and Submit will not be clicked, but Dice may retain a draft. Continue?",
+                "Open only the single highest-ranked eligible Easy Apply job and verify at most "
+                "one resume selection. Next and Submit will never be clicked, but Dice may "
+                "retain one draft. Continue?",
             ),
             RunMode.SUBMIT: (
                 "Confirm External Submissions",
@@ -1302,7 +1580,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             if run_mode is RunMode.PREVIEW:
                 review_warning += " Preview does not generate or upload a resume."
             elif run_mode is RunMode.VERIFY_UPLOAD:
-                review_warning += " Verify Upload may leave a Dice draft."
+                review_warning += " Verify Upload may leave one Dice draft."
             confirmation = (confirmation[0], f"{confirmation[1]}\n\n{review_warning}")
         if not messagebox.askyesno(
             confirmation[0],
@@ -1324,6 +1602,10 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
         self.jobs_skipped_label.config(text="0")
         self.jobs_ready_label.config(text="0")
         self.jobs_already_applied_label.config(text="0")
+        self.current_job_label.config(text="Preparing run")
+        self.current_step_label.config(text="Starting")
+        self.current_resume_label.config(text="Pending")
+        self.last_result_label.config(text="None")
 
         # Clear log text
         self.log_text.config(state="normal")
@@ -1331,6 +1613,12 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
         self.log_text.config(state="disabled")
 
         # Run job application process in a separate thread
+        credential_fingerprint = _credential_fingerprint(username, password)
+        session_cookies = (
+            self.login_session_cookies
+            if credential_fingerprint == self.verified_credentials_fingerprint
+            else ()
+        )
         self.job_thread = threading.Thread(
             target=self.run_job_application,
             args=(
@@ -1343,6 +1631,8 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                 headless,
                 job_limit,
                 run_mode,
+                credential_fingerprint,
+                session_cookies,
             ),
             daemon=True,
         )
@@ -1359,34 +1649,71 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
         headless,
         job_limit,
         run_mode,
+        credential_fingerprint,
+        session_cookies,
     ):
         """Run the job application process in a background thread"""
         driver = None
+        start_time = time.time()
+        jobs_to_apply = []
+        run_results = []
+        applied_count = 0
+        failed_count = 0
+        skipped_count = 0
+        ready_count = 0
+        already_applied_count = 0
+        top_preflight_reason = ""
+        last_attempt_reason = ""
+
+        def show_current_stop(reason):
+            self.show_stop_summary(
+                reason,
+                processed=len(run_results),
+                total=len(jobs_to_apply),
+                applied=applied_count,
+                ready=ready_count,
+                already_applied=already_applied_count,
+                skipped=skipped_count,
+                failed=failed_count,
+            )
+
         try:
-            # Record start time
-            start_time = time.time()
             self.logger.info(f"Starting {run_mode.value} run with queries: {search_queries}")
 
             # Initialize web driver
             self.update_status("Initializing web driver...")
             driver = get_web_driver(headless=headless)
 
-            # Login to Dice
-            self.update_status("Logging in to Dice...")
-            login_success = login_to_dice(driver, (username, password))
+            # Reuse the exact tested browser session when possible. Dice can expire cookies at
+            # any time, so this always falls back to a fresh credential login.
+            login_success, reused_session = authenticate_dice_session(
+                driver,
+                (username, password),
+                session_cookies=session_cookies,
+                status_callback=self.update_status,
+            )
             if not login_success:
-                self.update_status("Login failed. Please check your credentials.")
+                show_current_stop("Login failed")
                 self.root.after(
                     0,
                     lambda: messagebox.showerror(
                         "Login Failed", "Could not log in to Dice. Please check your credentials."
                     ),
                 )
-                driver.quit()
-                self.reset_ui()
                 return
 
-            self.update_status("Login successful. Fetching jobs...")
+            try:
+                refreshed_session_cookies = get_dice_session_cookies(driver)
+            except Exception:
+                refreshed_session_cookies = ()
+            self.root.after(
+                0,
+                lambda fingerprint=credential_fingerprint, cookies=refreshed_session_cookies: (
+                    self._remember_verified_login(fingerprint, cookies)
+                ),
+            )
+            if reused_session:
+                self.logger.info("Continuing with the in-memory verified Dice session")
 
             # Find jobs matching the search queries
             all_jobs = {}
@@ -1400,9 +1727,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
 
             for i, query in enumerate(search_queries):
                 if not self.running:
-                    self.update_status("Stopped by user.")
-                    driver.quit()
-                    self.reset_ui()
+                    show_current_stop("Stopped by user during job search")
                     return
 
                 self.update_status(f"Searching for '{query}' ({i + 1}/{total_queries})...")
@@ -1460,13 +1785,25 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                 try:
                     df_applied = pd.read_excel(applied_jobs_file)
                     already_applied = set(df_applied["Job URL"].dropna())
-                    self.update_status(
-                        f"Found {len(already_applied)} previously applied jobs to skip"
-                    )
                 except Exception as e:
                     raise RuntimeError(
                         "Could not safely read the prior-application ledger; run aborted."
                     ) from e
+
+            discovered_prior_applications = _discovered_prior_applications(
+                all_jobs, already_applied
+            )
+            already_applied_count = len(discovered_prior_applications)
+            self.root.after(
+                0,
+                lambda count=already_applied_count: self.jobs_already_applied_label.config(
+                    text=str(count)
+                ),
+            )
+            self.update_status(
+                f"Found {already_applied_count} discovered jobs already present in the "
+                "local application ledger"
+            )
 
             # Filter out already applied jobs, build a bounded round-robin pool across
             # searches, and apply the cap only after full-description resume ranking.
@@ -1482,6 +1819,15 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                 f"Scoring a diverse pool of {len(candidate_jobs)} candidates by full "
                 "job description..."
             )
+            preflight_message = (
+                "Preflight ranks candidates before opening any upload wizard; no upload yet."
+                if run_mode is RunMode.VERIFY_UPLOAD
+                else "Preflight reads and scores candidates; no upload yet."
+            )
+            self.root.after(
+                0,
+                lambda message=preflight_message: self.current_step_label.config(text=message),
+            )
             selection = rank_eligible_jobs(
                 driver,
                 candidate_jobs,
@@ -1489,27 +1835,76 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                 limit=job_limit,
                 cancel_requested=lambda: not self.running,
                 progress_callback=lambda current, total, title: self.update_status(
-                    f"Scoring candidate {current}/{total}: {title}"
+                    f"Preflight: reading/scoring candidate {current}/{total} — "
+                    f"no upload yet — {' '.join(str(title).split())[:120]}"
                 ),
             )
             if selection.cancelled or not self.running:
-                self.update_status("Stopped by user.")
-                driver.quit()
-                self.reset_ui()
+                skipped_count = len(selection.rejected_jobs)
+                self.show_stop_summary(
+                    "Stopped by user during resume-fit preflight",
+                    processed=selection.assessed_count,
+                    total=len(candidate_jobs),
+                    applied=applied_count,
+                    ready=ready_count,
+                    already_applied=already_applied_count,
+                    skipped=skipped_count,
+                    failed=failed_count,
+                )
                 return
 
-            jobs_to_apply = list(selection.selected_jobs)
+            jobs_to_apply = _ranked_jobs_for_run(selection, run_mode)
             excluded_jobs.extend(selection.rejected_jobs)
-            eligible_count = len(selection.selected_jobs) + len(selection.deferred_jobs)
-            action_label = {
-                RunMode.PREVIEW: "Previewing",
-                RunMode.VERIFY_UPLOAD: "Verifying one upload for",
-                RunMode.SUBMIT: "Applying to",
-            }[run_mode]
-            self.update_status(
-                f"{action_label} the top {len(jobs_to_apply)} of "
-                f"{eligible_count} resume-eligible jobs..."
+            preflight_reason_counts = _preflight_rejection_counts(selection.rejected_jobs)
+            skipped_count = sum(preflight_reason_counts.values())
+            self.root.after(
+                0,
+                lambda c=skipped_count: self.jobs_skipped_label.config(text=str(c)),
             )
+            for reason, count in preflight_reason_counts.most_common():
+                self.logger.info(f"Preflight skipped {count}: {_safe_ui_message(reason)}")
+            if preflight_reason_counts:
+                top_reason, top_reason_count = preflight_reason_counts.most_common(1)[0]
+                top_preflight_reason = top_reason
+                rejection_summary = (
+                    f"Preflight skipped {skipped_count}; top reason ({top_reason_count}): "
+                    f"{_safe_ui_message(top_reason)}"
+                )
+                self.root.after(
+                    0,
+                    lambda summary=rejection_summary: self.last_result_label.config(text=summary),
+                )
+            eligible_count = len(selection.selected_jobs) + len(selection.deferred_jobs)
+            if run_mode is RunMode.VERIFY_UPLOAD:
+                self.update_status(
+                    "Checking the single highest-ranked eligible job for one resume "
+                    "filename verification..."
+                )
+            else:
+                action_label = {
+                    RunMode.PREVIEW: "Previewing",
+                    RunMode.SUBMIT: "Applying to",
+                }[run_mode]
+                self.update_status(
+                    f"{action_label} the top {len(jobs_to_apply)} of "
+                    f"{eligible_count} resume-eligible jobs..."
+                )
+            if not jobs_to_apply:
+                top_reason = (
+                    preflight_reason_counts.most_common(1)[0][0]
+                    if preflight_reason_counts
+                    else "No candidate passed the resume and Easy Apply safety gates."
+                )
+                no_upload_message = (
+                    "No eligible job reached upload. "
+                    f"Preflight skipped {skipped_count}. Top reason: "
+                    f"{_safe_ui_message(top_reason)}"
+                )
+                self.update_status(no_upload_message)
+                self.root.after(
+                    0,
+                    lambda message=no_upload_message: self.current_step_label.config(text=message),
+                )
 
             # Save title-filtered and resume-ineligible jobs after the ranking pass so the
             # exclusion report explains every preflight rejection.
@@ -1521,12 +1916,6 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                     self.logger.info(f"Saved {len(excluded_jobs)} excluded jobs to {excluded_file}")
                 except Exception as e:
                     self.logger.error(f"Error saving excluded jobs: {e}")
-
-            # Update the Total Jobs count to show the jobs that will be processed
-            jobs_to_process_count = len(jobs_to_apply)
-            self.root.after(
-                0, lambda c=jobs_to_process_count: self.jobs_found_label.config(text=str(c))
-            )
 
             # Calculate initial estimated time (assuming 10 jobs per minute)
             jobs_per_minute = 10.0
@@ -1552,23 +1941,13 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                     0, lambda t=initial_estimate: self.estimated_time_label.config(text=t)
                 )
 
-            # Start applying to jobs
-            applied_count = 0
-            failed_count = 0
-            skipped_count = 0
-            ready_count = 0
-            already_applied_count = 0
-            run_results = []
-
             # Variables for dynamic time estimation
             job_start_times = []
             job_processing_times = []
 
             for i, job in enumerate(jobs_to_apply):
                 if not self.running:
-                    self.update_status("Stopped by user.")
-                    driver.quit()
-                    self.reset_ui()
+                    show_current_stop("Stopped by user between jobs")
                     return
 
                 # Record job start time for this specific job
@@ -1593,7 +1972,11 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                         resume_service,
                         run_mode=run_mode,
                         cancel_requested=lambda: not self.running,
+                        progress_callback=lambda event, current=i + 1, total=total_jobs: (
+                            self.show_application_progress(event, current, total)
+                        ),
                     )
+                    last_attempt_reason = result.reason
                     run_results.append(dict(job))
 
                     # Record job completion time and calculate processing time for this job
@@ -1744,11 +2127,31 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                         except Exception as e:
                             self.logger.error(f"Error updating not_applied Excel file: {e}")
 
+                    if run_mode is RunMode.VERIFY_UPLOAD:
+                        if result.status is ApplicationStatus.UPLOAD_VERIFIED:
+                            terminal_message = (
+                                "One resume filename was verified. Stopping before Next and Submit."
+                            )
+                        elif result.resume_selection_attempted:
+                            terminal_message = (
+                                "Resume selection was attempted but filename verification did "
+                                "not succeed. Stopping before Next or Submit."
+                            )
+                        else:
+                            terminal_message = (
+                                "The one-job upload check ended without selecting a resume. "
+                                "Next and Submit were not clicked."
+                            )
+                        self.update_status(terminal_message)
+
                 except Exception as e:
-                    self.logger.error(f"Error applying to {job_title}: {e}")
+                    safe_error = _safe_ui_message(e)
+                    safe_title = _safe_ui_message(job_title, 120)
+                    self.logger.error(f"Error processing {safe_title}: {safe_error}")
                     failed_count += 1
+                    last_attempt_reason = f"Unhandled {type(e).__name__}"
                     job["Application Status"] = ApplicationStatus.FAILED.value
-                    job["Application Reason"] = f"Unhandled {type(e).__name__}"
+                    job["Application Reason"] = last_attempt_reason
                     run_results.append(dict(job))
                     # Update failed count
                     count_to_display = failed_count
@@ -1763,10 +2166,25 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             minutes, seconds = divmod(remainder, 60)
 
             time_str = f"{int(hours)}h {int(minutes)}m {seconds:.2f}s"
-            self.update_status(
-                f"Completed! Applied: {applied_count}, Ready/verified: {ready_count}, "
-                f"Already applied: {already_applied_count}, Skipped: {skipped_count}, "
-                f"Failed: {failed_count}, Time: {time_str}"
+            completion_summary = _run_completion_summary(
+                selected_jobs=len(jobs_to_apply),
+                applied=applied_count,
+                ready=ready_count,
+                already_applied=already_applied_count,
+                skipped=skipped_count,
+                failed=failed_count,
+                elapsed=time_str,
+                top_preflight_reason=top_preflight_reason,
+                verify_upload=run_mode is RunMode.VERIFY_UPLOAD,
+                last_attempt_reason=last_attempt_reason,
+            )
+            self.update_status(completion_summary)
+            self.root.after(
+                0,
+                lambda summary=completion_summary: (
+                    self.current_step_label.config(text=summary),
+                    self.last_result_label.config(text=summary),
+                ),
             )
 
             # Final progress update
@@ -1793,6 +2211,8 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                     "Jobs Already Applied": already_applied_count,
                     "Jobs Skipped": skipped_count,
                     "Jobs Failed": failed_count,
+                    "Top Preflight Rejection Reason": top_preflight_reason,
+                    "Last Attempt Reason": last_attempt_reason,
                     "Execution Time": time_str,
                     "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 }
@@ -1812,7 +2232,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                 0,
                 lambda: messagebox.showinfo(
                     "Process Complete",
-                    f"Application process completed!\n\n"
+                    f"{completion_summary}\n\n"
                     f"Applied to {applied_count} jobs\n"
                     f"Ready or upload verified: {ready_count}\n"
                     f"Already applied: {already_applied_count}\n"
@@ -1822,13 +2242,12 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                 ),
             )
 
-            # Clean up
-            driver.quit()
-
         except Exception as e:
-            self.logger.error(f"Error in job application process: {e}")
-            self.update_status(f"Error: {str(e)}")
-            error_message = str(e)
+            error_message = _safe_ui_message(e)
+            self.logger.error(
+                f"Run stopped after {type(e).__name__}: {error_message}"
+            )
+            show_current_stop(f"{type(e).__name__}: {error_message}")
             self.root.after(
                 0,
                 lambda message=error_message: messagebox.showerror(
@@ -1856,12 +2275,87 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
 
     def reset_ui(self):
         """Reset UI after job completion or stop"""
-        self.running = False
-        self.start_button.config(state="normal")
-        self.stop_button.config(state="disabled", text="Stop")
+        def reset_controls():
+            self.running = False
+            self.start_button.config(state="normal")
+            self.stop_button.config(state="disabled", text="Stop")
+
+        self.root.after(0, reset_controls)
+
+    def show_application_progress(self, event, current, total):
+        """Surface one secret-free browser milestone in labels and the live log."""
+
+        job_text, step_text, resume_text, last_result = _application_progress_view(
+            event, current, total
+        )
+        self.logger.info(f"{job_text} | {step_text}")
+        if event.resume_filename and event.stage in {
+            ApplicationProgressStage.RESUME_READY,
+            ApplicationProgressStage.RESUME_SELECTED,
+        }:
+            self.logger.info(f"Resume | {resume_text}")
+        if last_result:
+            self.logger.info(f"Result | {last_result}")
+
+        def update_labels():
+            self.current_job_label.config(text=job_text)
+            self.current_step_label.config(text=step_text)
+            if event.stage is ApplicationProgressStage.OPENING_JOB:
+                self.current_resume_label.config(text="Pending")
+            elif event.stage is ApplicationProgressStage.COMPLETED:
+                if (
+                    self.current_resume_label.cget("text") == "Pending"
+                    and resume_text != "Pending"
+                ):
+                    self.current_resume_label.config(text=resume_text)
+            elif resume_text != "Pending":
+                self.current_resume_label.config(text=resume_text)
+            if last_result:
+                self.last_result_label.config(text=last_result)
+            self.status_label.config(text=f"{job_text} — {event.message}")
+
+        self.root.after(0, update_labels)
+
+    def show_stop_summary(
+        self,
+        reason,
+        *,
+        processed,
+        total,
+        applied,
+        ready,
+        already_applied,
+        skipped,
+        failed,
+    ):
+        safe_reason = _safe_ui_message(reason, 120)
+        summary = _run_stop_summary(
+            safe_reason,
+            processed=processed,
+            total=total,
+            applied=applied,
+            ready=ready,
+            already_applied=already_applied,
+            skipped=skipped,
+            failed=failed,
+        )
+        self.logger.info(summary)
+
+        def update_labels():
+            self.status_label.config(text=summary)
+            self.current_step_label.config(text=f"Stopped: {safe_reason}")
+            self.last_result_label.config(text=summary)
+            self.jobs_applied_label.config(text=str(applied))
+            self.jobs_ready_label.config(text=str(ready))
+            self.jobs_already_applied_label.config(text=str(already_applied))
+            self.jobs_skipped_label.config(text=str(skipped))
+            self.jobs_failed_label.config(text=str(failed))
+
+        self.root.after(0, update_labels)
 
     def update_status(self, message):
         """Update status message and log it"""
+        message = _safe_ui_message(message)
         self.logger.info(message)
         self.root.after(0, lambda msg=message: self.status_label.config(text=msg))
 

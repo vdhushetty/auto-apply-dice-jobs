@@ -1,12 +1,16 @@
+import json
 import os
 import platform
 import re
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
+from html import unescape
+from html.parser import HTMLParser
 from math import isfinite
 from typing import Any, Callable, Mapping
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -174,6 +178,36 @@ class RunMode(StrEnum):
     SUBMIT = "submit"
 
 
+class ApplicationProgressStage(StrEnum):
+    """Secret-free milestones surfaced by the desktop UI for one job."""
+
+    OPENING_JOB = "opening_job"
+    EVALUATING_RESUME = "evaluating_resume"
+    CHECKING_EASY_APPLY = "checking_easy_apply"
+    PREPARING_RESUME = "preparing_resume"
+    RESUME_READY = "resume_ready"
+    OPENING_WIZARD = "opening_wizard"
+    VERIFYING_UPLOAD = "verifying_upload"
+    RESUME_SELECTED = "resume_selected"
+    ADVANCING_WIZARD = "advancing_wizard"
+    SUBMITTING = "submitting"
+    SUBMISSION_CONFIRMED = "submission_confirmed"
+    COMPLETED = "completed"
+
+
+@dataclass(frozen=True)
+class ApplicationProgress:
+    """Bounded UI event that never contains credentials, descriptions, or full paths."""
+
+    stage: ApplicationProgressStage
+    message: str
+    job_title: str = ""
+    status: str = ""
+    resume_profile: str = ""
+    resume_filename: str = ""
+    resume_kind: str = ""
+
+
 @dataclass(frozen=True)
 class ApplicationResult:
     status: ApplicationStatus
@@ -181,6 +215,55 @@ class ApplicationResult:
     resume_profile: str = ""
     match_score: float | None = None
     resume_filename: str = ""
+    resume_selection_attempted: bool = False
+
+
+_OBSERVABILITY_SECRET = re.compile(
+    r"\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}\b",
+    re.IGNORECASE,
+)
+_OBSERVABILITY_LOCAL_PATH = re.compile(
+    r"(?<!:)/(?:Users|home|tmp|private|var)/[^,;\n]+|[A-Za-z]:\\[^,;\n]+"
+)
+
+
+def _compact_observability_text(value: Any, *, max_chars: int = 180) -> str:
+    """Collapse untrusted UI text and keep events bounded for logs and labels."""
+
+    compact = " ".join(str(value or "").split())
+    compact = _OBSERVABILITY_SECRET.sub("[redacted token]", compact)
+    compact = _OBSERVABILITY_LOCAL_PATH.sub("[local path]", compact)
+    return compact if len(compact) <= max_chars else f"{compact[: max_chars - 1]}…"
+
+
+def _safe_resume_filename(value: Any) -> str:
+    return _compact_observability_text(str(value or "").replace("\\", "/").rsplit("/", 1)[-1])
+
+
+def _emit_application_progress(
+    callback: Callable[[ApplicationProgress], None] | None,
+    stage: ApplicationProgressStage,
+    message: str,
+    *,
+    job_title: str,
+    status: str = "",
+    resume_profile: str = "",
+    resume_filename: str = "",
+    resume_kind: str = "",
+) -> None:
+    if callback is None:
+        return
+    event = ApplicationProgress(
+        stage=stage,
+        message=_compact_observability_text(message),
+        job_title=_compact_observability_text(job_title, max_chars=120),
+        status=_compact_observability_text(status, max_chars=40),
+        resume_profile=_compact_observability_text(resume_profile, max_chars=40),
+        resume_filename=_safe_resume_filename(resume_filename),
+        resume_kind=_compact_observability_text(resume_kind, max_chars=20),
+    )
+    with suppress(Exception):
+        callback(event)
 
 
 @dataclass(frozen=True)
@@ -208,25 +291,218 @@ def _visible_enabled(elements):
     )
 
 
+class _JobDescriptionHTMLParser(HTMLParser):
+    """Turn Dice's structured-data HTML description into readable plain text."""
+
+    _BLOCK_TAGS = {
+        "br",
+        "div",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "li",
+        "ol",
+        "p",
+        "section",
+        "table",
+        "tr",
+        "ul",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.fragments: list[str] = []
+        self._ignored_depth = 0
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # type: ignore[no-untyped-def]
+        normalized_tag = tag.lower()
+        if normalized_tag in {"script", "style"}:
+            self._ignored_depth += 1
+        elif not self._ignored_depth and normalized_tag in self._BLOCK_TAGS:
+            self.fragments.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized_tag = tag.lower()
+        if normalized_tag in {"script", "style"}:
+            self._ignored_depth = max(0, self._ignored_depth - 1)
+        elif not self._ignored_depth and normalized_tag in self._BLOCK_TAGS:
+            self.fragments.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self._ignored_depth:
+            self.fragments.append(data)
+
+
+def _normalize_description_text(value: str) -> str:
+    return "\n".join(
+        normalized
+        for line in unescape(value).splitlines()
+        if (normalized := " ".join(line.split()))
+    )
+
+
+def _plain_text_description(value: str) -> str:
+    parser = _JobDescriptionHTMLParser()
+    try:
+        parser.feed(value)
+        parser.close()
+    except Exception:
+        return ""
+    return _normalize_description_text("".join(parser.fragments))
+
+
+def _same_dice_job_detail_page(first_url: str, second_url: Any) -> bool:
+    """Return whether two URLs identify the same exact HTTPS Dice job-detail path."""
+
+    if not isinstance(second_url, str):
+        return False
+    if not _is_dice_url(first_url, job_detail=True) or not _is_dice_url(
+        second_url, job_detail=True
+    ):
+        return False
+    try:
+        first_path = urlparse(first_url).path.rstrip("/")
+        second_path = urlparse(second_url).path.rstrip("/")
+    except ValueError:
+        return False
+    return bool(first_path) and first_path == second_path
+
+
+def _extract_structured_job_description(driver) -> str:
+    """Read the canonical JobPosting description when Dice changes presentation CSS."""
+
+    try:
+        page_url = str(driver.current_url or "")
+    except Exception:
+        return ""
+    selectors = (
+        'script[data-testid="jobDetailStructuredData"]',
+        'script[type="application/ld+json"]',
+    )
+    for selector in selectors:
+        for element in driver.find_elements(By.CSS_SELECTOR, selector):
+            try:
+                raw = (
+                    element.get_attribute("textContent")
+                    or element.get_attribute("innerHTML")
+                    or element.text
+                    or ""
+                )
+            except Exception:
+                continue
+            # Refuse unexpectedly large page-controlled payloads instead of feeding them to
+            # the JSON or resume pipeline. Ordinary Dice JobPosting data is far smaller.
+            if not 2 <= len(raw) <= 1_000_000:
+                continue
+            try:
+                payload = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+
+            documents: list[dict[str, Any]] = []
+            candidates = payload if isinstance(payload, list) else (payload,)
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                documents.append(candidate)
+                graph = candidate.get("@graph")
+                if isinstance(graph, list):
+                    documents.extend(item for item in graph if isinstance(item, dict))
+            for document in documents:
+                schema_type = document.get("@type")
+                schema_types = schema_type if isinstance(schema_type, list) else (schema_type,)
+                if "JobPosting" not in schema_types:
+                    continue
+                if not _same_dice_job_detail_page(page_url, document.get("url")):
+                    continue
+                description = document.get("description")
+                if not isinstance(description, str) or len(description) > 250_000:
+                    continue
+                text = _plain_text_description(description)
+                if 100 <= len(text) <= 200_000:
+                    return text
+    return ""
+
+
 def _extract_job_description(driver) -> str:
     selectors = (
         '[data-testid="job-description"]',
         '[data-testid="jobDescription"]',
         "#jobDescription",
         ".job-description",
+        # Dice's current Next.js job page uses a content-hashed CSS module prefix,
+        # for example ``job-detail-description-module__...__jobDescription``.
+        '[class*="job-detail-description-module"][class*="jobDescription"]',
     )
     deadline = time.time() + 12
     while time.time() < deadline:
         for selector in selectors:
             for element in driver.find_elements(By.CSS_SELECTOR, selector):
-                text = "\n".join(line.strip() for line in element.text.splitlines() if line.strip())
+                text = _normalize_description_text(element.text or "")
                 if len(text) >= 100:
                     return text
+        structured_description = _extract_structured_job_description(driver)
+        if structured_description:
+            return structured_description
         time.sleep(0.4)
     return ""
 
 
-def _find_apply_control(driver):
+def _dice_job_identifier(url: str) -> str:
+    if not _is_dice_url(url, job_detail=True):
+        return ""
+    parts = [part for part in urlparse(url).path.split("/") if part]
+    if len(parts) != 2 or parts[0] != "job-detail":
+        return ""
+    return parts[1]
+
+
+def _is_expected_dice_application_url(candidate_url: str, job_url: str) -> bool:
+    if not _is_dice_url(candidate_url):
+        return False
+    job_identifier = _dice_job_identifier(job_url)
+    if not job_identifier:
+        return False
+    parts = [part for part in urlparse(candidate_url).path.split("/") if part]
+    return (
+        len(parts) == 3
+        and parts[0] == "job-applications"
+        and parts[1] == job_identifier
+        and parts[2] in {"start-apply", "wizard"}
+    )
+
+
+def _is_expected_dice_apply_target(candidate_url: str, job_url: str) -> bool:
+    """Accept a direct wizard URL or Dice's login wrapper for that exact wizard."""
+
+    if _is_expected_dice_application_url(candidate_url, job_url):
+        return True
+    if not _is_dice_url(candidate_url):
+        return False
+    parsed = urlparse(candidate_url)
+    if parsed.path.rstrip("/") != "/dashboard/login":
+        return False
+    redirect_values = parse_qs(parsed.query).get("redirectUrl", [])
+    if len(redirect_values) != 1:
+        return False
+    redirect_path = redirect_values[0]
+    if not redirect_path.startswith("/") or redirect_path.startswith("//"):
+        return False
+    return _is_expected_dice_application_url(
+        f"https://www.dice.com{redirect_path}", job_url
+    )
+
+
+def _is_expected_apply_context(current_url: str, job_url: str) -> bool:
+    return _same_dice_job_detail_page(current_url, job_url) or (
+        _is_expected_dice_application_url(current_url, job_url)
+    )
+
+
+def _find_apply_control(driver, job_url: str):
     controls = driver.find_elements(
         By.CSS_SELECTOR,
         'button[data-testid="apply-button"], a[data-testid="apply-button"]',
@@ -247,10 +523,12 @@ def _find_apply_control(driver):
         (
             control
             for control in visible
-            if "easy apply" in (control.text or "").strip().lower()
-            or (
-                "/job-applications/" in (control.get_attribute("href") or "").lower()
-                and "/wizard" in (control.get_attribute("href") or "").lower()
+            if (
+                not (control.get_attribute("href") or "").strip()
+                and "easy apply" in (control.text or "").strip().lower()
+            )
+            or _is_expected_dice_apply_target(
+                (control.get_attribute("href") or "").strip(), job_url
             )
         ),
         None,
@@ -262,20 +540,62 @@ def _browser_filename(value: str) -> str:
     return value.replace("\\", "/").rsplit("/", 1)[-1].strip().lower()
 
 
+_RESUME_INPUT_TERM = re.compile(r"\b(?:resume|curriculum\s+vitae|cv)\b", re.IGNORECASE)
+_NON_RESUME_INPUT_TERM = re.compile(
+    r"\b(?:avatar|cover\s*letter|photo|portfolio|profile\s*(?:image|picture))\b",
+    re.IGNORECASE,
+)
+
+
+def _file_input_descriptor(driver, file_input) -> str:
+    values = []
+    for attribute in ("name", "id", "aria-label", "data-testid", "title"):
+        try:
+            values.append(str(file_input.get_attribute(attribute) or ""))
+        except Exception:
+            continue
+    try:
+        dom_context = driver.execute_script(
+            "const el = arguments[0]; "
+            "const labels = el.labels ? Array.from(el.labels).map(x => x.innerText || '') : []; "
+            "const parent = el.closest('[data-testid*=resume], [class*=resume], [id*=resume], "
+            "[data-testid*=cv], [class*=cv], [id*=cv]'); "
+            "return [...labels, parent ? (parent.innerText || '') : ''].join(' ');",
+            file_input,
+        )
+        values.append(str(dom_context or ""))
+    except Exception:
+        pass
+    descriptor = " ".join(values)
+    descriptor = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", descriptor)
+    descriptor = re.sub(r"[_-]+", " ", descriptor)
+    return " ".join(descriptor.split())
+
+
 def _upload_resume_if_present(
     driver,
     resume_path: str,
     *,
     pre_upload: Callable[[], None] | None = None,
+    selection_callback: Callable[[], None] | None = None,
 ) -> tuple[bool, bool]:
     inputs = driver.find_elements(By.CSS_SELECTOR, 'input[type="file"]')
     if not inputs:
         return False, False
-    filename = os.path.basename(resume_path).lower()
+    resume_inputs = []
     for file_input in inputs:
+        descriptor = _file_input_descriptor(driver, file_input)
+        if _RESUME_INPUT_TERM.search(descriptor) and not _NON_RESUME_INPUT_TERM.search(descriptor):
+            resume_inputs.append(file_input)
+    if len(resume_inputs) != 1:
+        return True, False
+    filename = os.path.basename(resume_path).lower()
+    for file_input in resume_inputs:
         try:
             if pre_upload is not None:
                 pre_upload()
+            if selection_callback is not None:
+                selection_callback()
             file_input.send_keys(resume_path)
 
             def intended_file_selected(current_driver):
@@ -519,6 +839,15 @@ def rank_eligible_jobs(
 
             try:
                 driver.get(job_url)
+                current_url = str(driver.current_url or "")
+                if not _same_dice_job_detail_page(job_url, current_url):
+                    reject(
+                        job,
+                        "Dice redirected to a different job detail; skipped to avoid "
+                        "matching or applying to the wrong posting.",
+                    )
+                    assessed_count += 1
+                    continue
                 description = _extract_job_description(driver)
             except Exception:
                 reject(job, "Dice job details could not be opened for safe ranking.")
@@ -626,6 +955,7 @@ def apply_to_job_url(
     *,
     run_mode: RunMode | str = RunMode.SUBMIT,
     cancel_requested: Callable[[], bool] | None = None,
+    progress_callback: Callable[[ApplicationProgress], None] | None = None,
 ) -> ApplicationResult:
     """Prepare, upload, and submit one Dice Easy Apply job; fail closed on uncertainty."""
 
@@ -637,6 +967,7 @@ def apply_to_job_url(
     original_url = driver.current_url
     result = ApplicationResult(ApplicationStatus.FAILED, "Application did not complete.")
     navigated = False
+    resume_selection_attempted = False
     try:
         if not _is_dice_url(job_url, job_detail=True):
             result = ApplicationResult(
@@ -650,8 +981,22 @@ def apply_to_job_url(
                 "Run cancelled before navigation.",
             )
             return result
+        _emit_application_progress(
+            progress_callback,
+            ApplicationProgressStage.OPENING_JOB,
+            "Opening Dice job details",
+            job_title=job_title,
+        )
         driver.get(job_url)
         navigated = True
+        current_url = str(driver.current_url or "")
+        if not _same_dice_job_detail_page(job_url, current_url):
+            result = ApplicationResult(
+                ApplicationStatus.SKIPPED,
+                "Dice redirected to a different job detail; skipped to avoid applying "
+                "to the wrong posting.",
+            )
+            return result
         description = _extract_job_description(driver)
         if not description:
             result = ApplicationResult(
@@ -671,6 +1016,12 @@ def apply_to_job_url(
             result = ApplicationResult(ApplicationStatus.SKIPPED, str(exc))
             return result
 
+        _emit_application_progress(
+            progress_callback,
+            ApplicationProgressStage.EVALUATING_RESUME,
+            "Evaluating full job description and resume fit",
+            job_title=job_title,
+        )
         evaluation = None
         preparation = None
         evaluator = getattr(resume_service, "evaluate", None)
@@ -699,11 +1050,18 @@ def apply_to_job_url(
             )
             return result
 
+        _emit_application_progress(
+            progress_callback,
+            ApplicationProgressStage.CHECKING_EASY_APPLY,
+            "Checking Dice Easy Apply eligibility",
+            job_title=job_title,
+            resume_profile=profile,
+        )
         apply_control = WebDriverWait(driver, 20).until(
-            lambda current: _find_apply_control(current)
+            lambda current: _find_apply_control(current, job_url)
         )
         control_text = (apply_control.text or "").strip().lower()
-        control_href = (apply_control.get_attribute("href") or "").strip().lower()
+        control_href = (apply_control.get_attribute("href") or "").strip()
         if "applied" in control_text or "application submitted" in control_text:
             result = ApplicationResult(
                 ApplicationStatus.ALREADY_APPLIED,
@@ -712,9 +1070,9 @@ def apply_to_job_url(
                 match_score=score,
             )
             return result
-        is_easy_apply = "easy apply" in control_text or (
-            "/job-applications/" in control_href and "/wizard" in control_href
-        )
+        is_easy_apply = (
+            not control_href and "easy apply" in control_text
+        ) or _is_expected_dice_apply_target(control_href, job_url)
         if not is_easy_apply:
             result = ApplicationResult(
                 ApplicationStatus.SKIPPED,
@@ -740,6 +1098,13 @@ def apply_to_job_url(
             )
             return result
 
+        _emit_application_progress(
+            progress_callback,
+            ApplicationProgressStage.PREPARING_RESUME,
+            "Preparing the approved resume for this job",
+            job_title=job_title,
+            resume_profile=profile,
+        )
         if preparation is None:
             prepare_selected = getattr(resume_service, "prepare_selected", None)
             if callable(prepare_selected) and evaluation is not None:
@@ -760,8 +1125,18 @@ def apply_to_job_url(
             )
             return result
         prepared_path = preparation.prepared.path.resolve()
+        resume_kind = "generated" if preparation.prepared.tailored else "selected"
         if isinstance(job, dict):
             job["Tailored Resume"] = bool(preparation.prepared.tailored)
+        _emit_application_progress(
+            progress_callback,
+            ApplicationProgressStage.RESUME_READY,
+            f"{resume_kind.title()} resume ready",
+            job_title=job_title,
+            resume_profile=profile,
+            resume_filename=prepared_path.name,
+            resume_kind=resume_kind,
+        )
 
         def assert_prepared_resume_ready() -> None:
             guard = getattr(resume_service, "assert_prepared_resume_ready", None)
@@ -790,6 +1165,15 @@ def apply_to_job_url(
                 match_score=score,
             )
             return result
+        _emit_application_progress(
+            progress_callback,
+            ApplicationProgressStage.OPENING_WIZARD,
+            "Opening Dice Easy Apply wizard",
+            job_title=job_title,
+            resume_profile=profile,
+            resume_filename=prepared_path.name,
+            resume_kind=resume_kind,
+        )
         try:
             apply_control.click()
         except Exception:
@@ -806,11 +1190,26 @@ def apply_to_job_url(
             "(normalize-space(.)='Submit' or .//span[normalize-space()='Submit'])]",
         )
         resume_uploaded = False
+
+        def mark_resume_selection_attempted() -> None:
+            nonlocal resume_selection_attempted
+            resume_selection_attempted = True
+
+        _emit_application_progress(
+            progress_callback,
+            ApplicationProgressStage.VERIFYING_UPLOAD,
+            "Waiting for the resume picker and verifying the selected filename",
+            job_title=job_title,
+            resume_profile=profile,
+            resume_filename=prepared_path.name,
+            resume_kind=resume_kind,
+        )
         for _ in range(12):
-            if not _is_dice_url(driver.current_url):
+            if not _is_expected_apply_context(str(driver.current_url or ""), job_url):
                 result = ApplicationResult(
                     ApplicationStatus.SKIPPED,
-                    "Apply navigation left Dice; external applications are not automated.",
+                    "Apply navigation did not remain in this job's Dice Easy Apply context; "
+                    "the resume was not selected.",
                     resume_profile=profile,
                     match_score=score,
                 )
@@ -830,6 +1229,7 @@ def apply_to_job_url(
                         driver,
                         str(prepared_path),
                         pre_upload=assert_prepared_resume_ready,
+                        selection_callback=mark_resume_selection_attempted,
                     )
                 except ResumeTailoringError as exc:
                     result = ApplicationResult(
@@ -837,6 +1237,7 @@ def apply_to_job_url(
                         str(exc),
                         resume_profile=profile,
                         match_score=score,
+                        resume_selection_attempted=resume_selection_attempted,
                     )
                     return result
                 if found_input and not upload_succeeded:
@@ -845,9 +1246,20 @@ def apply_to_job_url(
                         "The intended resume could not be uploaded and verified.",
                         resume_profile=profile,
                         match_score=score,
+                        resume_selection_attempted=resume_selection_attempted,
                     )
                     return result
                 resume_uploaded = upload_succeeded
+                if resume_uploaded:
+                    _emit_application_progress(
+                        progress_callback,
+                        ApplicationProgressStage.RESUME_SELECTED,
+                        "Resume selected in Dice; intended filename verified",
+                        job_title=job_title,
+                        resume_profile=profile,
+                        resume_filename=prepared_path.name,
+                        resume_kind=resume_kind,
+                    )
                 if resume_uploaded and mode is RunMode.VERIFY_UPLOAD:
                     result = ApplicationResult(
                         ApplicationStatus.UPLOAD_VERIFIED,
@@ -856,6 +1268,7 @@ def apply_to_job_url(
                         resume_profile=profile,
                         match_score=score,
                         resume_filename=prepared_path.name,
+                        resume_selection_attempted=True,
                     )
                     return result
 
@@ -916,6 +1329,15 @@ def apply_to_job_url(
                         resume_filename=prepared_path.name,
                     )
                     return result
+                _emit_application_progress(
+                    progress_callback,
+                    ApplicationProgressStage.SUBMITTING,
+                    "Submitting the verified Dice application",
+                    job_title=job_title,
+                    resume_profile=profile,
+                    resume_filename=prepared_path.name,
+                    resume_kind=resume_kind,
+                )
                 try:
                     submit_button.click()
                 except Exception:
@@ -931,6 +1353,16 @@ def apply_to_job_url(
                         resume_filename=prepared_path.name,
                     )
                     return result
+                _emit_application_progress(
+                    progress_callback,
+                    ApplicationProgressStage.SUBMISSION_CONFIRMED,
+                    "Dice confirmed the application submission",
+                    job_title=job_title,
+                    status=ApplicationStatus.APPLIED.value,
+                    resume_profile=profile,
+                    resume_filename=prepared_path.name,
+                    resume_kind=resume_kind,
+                )
                 result = ApplicationResult(
                     ApplicationStatus.APPLIED,
                     "Dice confirmed the application submission.",
@@ -971,6 +1403,15 @@ def apply_to_job_url(
                         resume_filename=prepared_path.name if resume_uploaded else "",
                     )
                     return result
+                _emit_application_progress(
+                    progress_callback,
+                    ApplicationProgressStage.ADVANCING_WIZARD,
+                    "Advancing to the next verified Dice wizard step",
+                    job_title=job_title,
+                    resume_profile=profile,
+                    resume_filename=prepared_path.name if resume_uploaded else "",
+                    resume_kind=resume_kind,
+                )
                 try:
                     next_button.click()
                 except Exception:
@@ -991,10 +1432,20 @@ def apply_to_job_url(
         result = ApplicationResult(
             ApplicationStatus.FAILED,
             f"Application flow failed: {type(exc).__name__}.",
+            resume_selection_attempted=resume_selection_attempted,
         )
         return result
     finally:
         _record_resume_metadata(job, result)
+        _emit_application_progress(
+            progress_callback,
+            ApplicationProgressStage.COMPLETED,
+            result.reason,
+            job_title=job_title,
+            status=result.status.value,
+            resume_profile=result.resume_profile,
+            resume_filename=result.resume_filename,
+        )
         if navigated and original_url:
             try:
                 driver.get(original_url)

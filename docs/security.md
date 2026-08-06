@@ -12,9 +12,11 @@ authorization and complying with applicable terms and law.
 The browser adapter supports only same-origin Dice Easy Apply. External employer/ATS links are
 skipped. Do not add stealth, CAPTCHA bypass, sandbox disabling, or bot-evasion behavior.
 
-Preview is the default and never clicks Apply. Upload verification is capped at one job and never
-clicks Next or Submit. Submit mode refuses unknown visible form controls instead of answering or
-accepting screening questions and consents on the user's behalf.
+Preview is the default and never clicks Apply. Upload verification opens only the single
+highest-ranked eligible job, permits at most one resume file-selection attempt, and stops whether
+the filename check succeeds or fails; it never clicks Next or Submit. The confirmation warns that
+Dice may retain that one draft. Submit mode refuses unknown visible form controls instead of
+answering or accepting screening questions and consents on the user's behalf.
 
 ## Secrets and local data
 
@@ -27,6 +29,9 @@ accepting screening questions and consents on the user's behalf.
   screenshots, issue reports, or model eval datasets.
 - Application logs may contain job titles/URLs and result reasons, never credentials, resume
   bodies, full job descriptions, prompts, API responses, or hidden model reasoning.
+- A tested Dice session is held only in process memory. Only Dice-domain cookies are eligible for
+  transfer to the run browser, reuse must pass a protected-profile check, and cookie names/values
+  are never persisted or logged. Credential edits invalidate the cached session immediately.
 - Rotate credentials immediately if an ignored file is accidentally exposed; deleting Git
   history alone is not sufficient.
 
@@ -73,11 +78,19 @@ checks remain mandatory. Skip review is not a validation bypass.
 
 The GUI requires one of the two review policies before starting AI bullet automation and repeats
 the selected policy in the per-run confirmation. The Skip review confirmation states that it
-bypasses only human inspection. Verify Upload also warns that Dice may retain a draft.
+bypasses only human inspection. Verify Upload also warns that Dice may retain drafts.
 
 Before Submit, the browser must verify the chosen/generated filename from the scoped file input's
 `files[0].name` or exact input value. Global page text is not upload evidence. A click is never
 considered success; Dice must display a visible, scoped confirmation element.
+The requested job-detail path, canonical structured-data URL, post-navigation path, and Easy Apply
+job identifier must agree. File selection requires exactly one resume/CV-labelled input; ambiguous
+or unrelated attachment fields fail closed.
+
+The UI progress channel is observational only: callback failures cannot change browser behavior.
+Messages are length-bounded and redact secret-like tokens and local paths. It distinguishes the
+read-only ranking preflight from upload activity and records exact skip/failure categories without
+including job-description or resume bodies.
 
 ## Remaining risks
 

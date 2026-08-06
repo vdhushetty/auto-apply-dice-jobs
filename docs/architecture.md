@@ -39,6 +39,9 @@ Dice Easy Apply <---- exact file path ---- verify input.files[0].name
 local override, validates resume configuration before starting, and passes immutable values to
 the worker. In AI bullet mode it requires a readonly **Review before apply** or **Skip review**
 selection, persists the stable policy value locally, and repeats it in the run confirmation.
+It also retains a tested Dice session in memory for the current process, validates reuse on a
+protected profile route, and exposes secret-free structured progress in Current job, Current
+step, Resume, and Last result fields.
 
 `core/main_script.py` is the external Dice adapter. It extracts the detail-page description,
 builds a bounded round-robin pool across search queries, requests side-effect-free resume
@@ -47,6 +50,13 @@ prepared resume, restricts automation to Dice Easy Apply, verifies the uploaded 
 converts the browser result into `applied`, `already_applied`, `skipped`, or `failed`, plus the
 non-submitting `preview_ready` and `upload_verified` outcomes. It refuses visible screening
 controls and supports cancellation checks before every consequential click.
+Description extraction first uses known visible containers and then Dice's canonical
+`JobPosting` JSON-LD. JSON type and size are bounded, HTML is converted to text without
+script/style content, and its exact Dice job-detail URL must match the requested/current page.
+Redirects to a different job fail closed. After Apply, the adapter accepts only the same job page
+or that job identifier's Dice `start-apply`/`wizard` path and selects a file only when exactly one
+input is unambiguously labelled as a resume/CV. Browser milestones are emitted as bounded events
+containing only job title, step, outcome, profile, and basename.
 
 `core/resumes/selector.py` is pure domain logic. It canonicalizes a version-controlled set of
 cloud/data/AI terms, combines weighted title/description coverage with a small lexical signal,

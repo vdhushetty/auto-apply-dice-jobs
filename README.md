@@ -54,13 +54,24 @@ The application skips instead of submitting when any of these checks fail:
 Each run also requires an explicit confirmation in the GUI. Resume contents, job descriptions,
 and API keys are not written to application logs.
 
+After **Test Login** succeeds, the Settings tab keeps a visible verified indicator. The temporary
+test browser still closes, but its Dice-domain session cookies are retained in memory only and
+reused by the next run when Dice accepts them. Expired sessions fall back to a normal login; no
+cookie value is persisted or logged.
+
 Three side-effect levels are available:
 
 - **Preview:** sample search queries round-robin, score full descriptions, inspect the highest-fit
   eligible jobs up to the configured limit, and never click Apply.
-- **Verify upload:** one-job maximum; select and verify the exact resume file, then stop before
-  Next or Submit. Dice may retain a draft.
+- **Verify upload:** open only the single highest-ranked eligible job and make at most one resume
+  file-selection attempt. Stop whether filename verification succeeds or fails; Next and Submit
+  are never clicked. Dice may retain that one draft.
 - **Submit:** upload and submit only after all fit, upload, form, and confirmation checks pass.
+
+The **Live Automation** panel distinguishes candidate preflight ("no upload yet") from the actual
+Easy Apply flow. It shows the current job and step, selected or generated resume filename/profile,
+browser-side filename verification, and the final reason for a skip or failure. Preflight
+rejections count as skips, and a zero-eligible run displays its most common rejection reason.
 
 ## Prerequisites
 

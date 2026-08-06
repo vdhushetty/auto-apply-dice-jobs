@@ -15,9 +15,14 @@ Dice account, every source resume, and every factual claim in them.
 4. Start in preview mode. Build a bounded round-robin sample across the configured searches,
    read each sampled full job description, rank resume-eligible jobs by match score, and inspect
    the highest-fit jobs without clicking Apply.
-5. Optionally verify one exact upload without advancing the wizard.
+5. Optionally open only the single highest-ranked eligible candidate, permit at most one resume
+   file-selection attempt, and stop whether its filename check succeeds or fails without
+   advancing the wizard. Dice may retain that one draft.
 6. Use submit mode only when ready; submit through Dice Easy Apply and record preview-ready,
    upload-verified, confirmed, skipped, already-applied, and failed outcomes separately.
+7. Follow the Live Automation panel through preflight, resume preparation, Easy Apply, filename
+   verification, and the final outcome; every rejected candidate or stopped run exposes a bounded
+   reason without resume contents, credentials, API keys, or local paths.
 
 ## Functional policy
 
@@ -34,7 +39,8 @@ Dice account, every source resume, and every factual claim in them.
   upload. `skip_review` bypasses only that human-inspection prompt; all deterministic generation,
   evidence, structure, layout, relevance, upload, form, and confirmation checks remain active.
 - A valid AI review-policy selection is required before any AI bullet automation starts and is
-  repeated in the run confirmation. Verify Upload warns that Dice may retain a draft.
+  repeated in the run confirmation. Verify Upload warns that it may leave one Dice draft after
+  its one permitted file-selection attempt.
 - The relevance threshold is applied before any OpenAI call or Apply click.
 - Close winners, explicit clearance/citizenship/sponsorship/W2/onsite restrictions, missing
   required technologies, and visible screening questions require manual review or a skip.
@@ -42,6 +48,9 @@ Dice account, every source resume, and every factual claim in them.
 - AI bullet output must retain source page count and pass bullet-only/non-target structure checks.
 - A local rule always wins over model output.
 - Unknown, ambiguous, external, malformed, or unconfirmed states are skipped or failed.
+- A successful credential test remains visibly verified for the current app process. Its
+  Dice-domain cookies may be reused in memory after protected-page validation; expired reuse
+  falls back to the normal credential login.
 
 ## Success criteria
 
