@@ -21,7 +21,8 @@ accepting screening questions and consents on the user's behalf.
 - `.env` contains Dice credentials and optionally an OpenAI key; it is ignored and must remain
   local with restrictive file permissions. The masked API-key field is persisted only when its
   explicit checkbox is selected; the key never enters settings JSON, manifests, reports, or logs.
-- `config/settings.local.json` contains personal paths and is ignored.
+- `config/settings.local.json` contains personal paths and the selected non-secret AI review
+  policy; it is ignored.
 - Source resumes and generated `.data/` files contain PII and must not enter Git, fixtures, logs,
   screenshots, issue reports, or model eval datasets.
 - Application logs may contain job titles/URLs and result reasons, never credentials, resume
@@ -64,8 +65,15 @@ Every generated DOCX is rendered through LibreOffice and must retain the source 
 page-count change deletes the file and skips the job. Skill-order cache manifests bind source and
 output hashes to a layout-verified artifact. AI bullet caches additionally store the validated
 plan and bind the job/model/prompt; cached copies rerun bullet-only/non-target structure
-validation. Before any AI-generated file is uploaded, the app opens it for review and records an
-approval bound to exact source/output/job/manifest hashes. Any later change invalidates approval.
+validation. When `review_before_apply` is selected, the app opens each AI-generated file and
+records approval bound to exact source/output/job/manifest hashes before upload. Any later change
+invalidates that approval. When `skip_review` is selected, the human-inspection callback is
+omitted, but all evidence, structure, page-count, matching, filename, form, and confirmation
+checks remain mandatory. Skip review is not a validation bypass.
+
+The GUI requires one of the two review policies before starting AI bullet automation and repeats
+the selected policy in the per-run confirmation. The Skip review confirmation states that it
+bypasses only human inspection. Verify Upload also warns that Dice may retain a draft.
 
 Before Submit, the browser must verify the chosen/generated filename from the scoped file input's
 `files[0].name` or exact input value. Global page text is not upload evidence. A click is never
@@ -82,3 +90,6 @@ considered success; Dice must display a visible, scoped confirmation element.
   false positives but may increase false negatives.
 - LibreOffice pagination can differ from Microsoft Word. Equal LibreOffice page counts are a
   fail-closed baseline, not a guarantee of identical rendering in every Word version.
+- Deterministic checks cannot prove that every generated phrase matches the user's intended
+  meaning. `review_before_apply` mitigates that risk; selecting `skip_review` explicitly accepts
+  it for bounded, locally validated bullet changes.

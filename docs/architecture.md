@@ -19,7 +19,12 @@ Dice search cards --> Dice detail page --> title + full description
                                                                 |
                                             structure-preserving DOCX + page parity
                                                                 |
-                                              exact-hash human review (AI bullets)
+                                      explicit AI review-policy gate
+                                         /                      \
+                           exact-hash approval                 skip prompt
+                         (review_before_apply)              (skip_review)
+                                         \                      /
+                                          deterministic checks remain
                                                                 |
 Dice Easy Apply <---- exact file path ---- verify input.files[0].name
        |                         |                       |
@@ -32,7 +37,8 @@ Dice Easy Apply <---- exact file path ---- verify input.files[0].name
 
 `app_tkinter.py` owns interaction and run orchestration. It reads safe defaults plus an ignored
 local override, validates resume configuration before starting, and passes immutable values to
-the worker.
+the worker. In AI bullet mode it requires a readonly **Review before apply** or **Skip review**
+selection, persists the stable policy value locally, and repeats it in the run confirmation.
 
 `core/main_script.py` is the external Dice adapter. It extracts the detail-page description,
 builds a bounded round-robin pool across search queries, requests side-effect-free resume
@@ -79,8 +85,10 @@ three source files.
 `core/resumes/service.py` is the application boundary. It validates the mode-specific source set,
 selects a source for every job, avoids OpenAI entirely during evaluation/Preview, and caches
 generated filenames by job/source/prompt/model fingerprints. AI cache manifests bind the source,
-output, job, model, prompt, layout result, and validated edit plan. Before upload, a GUI-thread
-review callback opens the file; approval binds the exact source/output/job/manifest hashes.
+output, job, model, prompt, layout result, and validated edit plan. With `review_before_apply`, a
+GUI-thread review callback opens the file and approval binds the exact source/output/job/manifest
+hashes. With `skip_review`, only that callback is bypassed; the same generation, cache, evidence,
+document, layout, match, and upload-integrity checks run.
 OpenAI client construction and document generation remain deferred until an upload mode needs a
 file.
 

@@ -48,6 +48,30 @@ class ResumeMode(StrEnum):
             ) from exc
 
 
+class AIReviewPolicy(StrEnum):
+    """Human-review policy applied to AI-generated bullet resumes."""
+
+    REVIEW_BEFORE_APPLY = "review_before_apply"
+    SKIP_REVIEW = "skip_review"
+
+    @classmethod
+    def parse(cls, value: str) -> AIReviewPolicy:
+        normalized = value.strip().lower()
+        aliases = {
+            "review before apply": cls.REVIEW_BEFORE_APPLY,
+            "skip review": cls.SKIP_REVIEW,
+        }
+        if normalized in aliases:
+            return aliases[normalized]
+        try:
+            return cls(normalized)
+        except ValueError as exc:
+            supported = ", ".join(policy.value for policy in cls)
+            raise ResumeConfigurationError(
+                f"Unsupported AI review policy '{value}'. Expected one of: {supported}."
+            ) from exc
+
+
 class CloudProfile(StrEnum):
     """The three candidate resume variants supported by the product."""
 

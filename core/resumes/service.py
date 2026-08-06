@@ -45,6 +45,7 @@ from .documents import (
 )
 from .layout import DocxLayoutVerifier
 from .models import (
+    AIReviewPolicy,
     CloudProfile,
     CustomProfile,
     JobPosting,
@@ -90,8 +91,11 @@ class ResumeService:
         model: str | None = None,
         safety_identity: str = "",
         layout_verifier: LayoutVerifier | None = None,
+        ai_review_policy: AIReviewPolicy = AIReviewPolicy.REVIEW_BEFORE_APPLY,
         review_callback: ReviewCallback | None = None,
     ) -> None:
+        if not isinstance(ai_review_policy, AIReviewPolicy):
+            raise ResumeConfigurationError("AI review policy must be a supported typed value.")
         self.mode = mode
         self._output_dir = (
             Path(ai_output_dir if mode is ResumeMode.AI_BULLETS else output_dir)
@@ -104,6 +108,7 @@ class ResumeService:
         self._planner_model: str | None = None
         self._safety_identity = safety_identity
         self._layout_verifier: LayoutVerifier | None = None
+        self._ai_review_policy = ai_review_policy
         self._review_callback = review_callback
         self._variants: tuple[ResumeVariant, ...]
         self._selector: ResumeSelector | SingleResumeSelector
@@ -206,6 +211,13 @@ class ResumeService:
             or str(settings.get("openai_model", "")).strip()
             or None
         )
+        raw_review_policy = settings.get(
+            "ai_review_policy",
+            AIReviewPolicy.REVIEW_BEFORE_APPLY.value,
+        )
+        if not isinstance(raw_review_policy, str):
+            raise ResumeConfigurationError("ai_review_policy must be a string.")
+        ai_review_policy = AIReviewPolicy.parse(raw_review_policy)
         return cls(
             mode=mode,
             paths=paths,
@@ -220,6 +232,7 @@ class ResumeService:
             model=model,
             safety_identity=safety_identity,
             layout_verifier=layout_verifier,
+            ai_review_policy=ai_review_policy,
             review_callback=review_callback,
         )
 
@@ -273,7 +286,10 @@ class ResumeService:
                 reason=str(exc),
                 decision=decision,
             )
-        if self.mode is ResumeMode.AI_BULLETS:
+        if (
+            self.mode is ResumeMode.AI_BULLETS
+            and self._ai_review_policy is AIReviewPolicy.REVIEW_BEFORE_APPLY
+        ):
             try:
                 self._require_review_approval(job, decision.selected_path, prepared_path)
             except ResumeTailoringError as exc:
@@ -301,12 +317,12 @@ class ResumeService:
             return evaluation
         return self.prepare_selected(job, evaluation.decision)
 
-    def assert_prepared_resume_approved(
+    def assert_prepared_resume_ready(
         self,
         job: JobPosting,
         prepared: PreparedResume,
     ) -> str:
-        """Revalidate an AI artifact and its exact-hash approval immediately before use."""
+        """Revalidate an AI artifact and enforce its configured review policy before use."""
 
         try:
             output_digest = self._file_digest(prepared.path)
@@ -319,7 +335,10 @@ class ResumeService:
             raise ResumeTailoringError(
                 "AI-tailored resume changed after validation; the application was skipped."
             )
-        if not self._ai_approval_is_valid(job, source_path, prepared.path):
+        if (
+            self._ai_review_policy is AIReviewPolicy.REVIEW_BEFORE_APPLY
+            and not self._ai_approval_is_valid(job, source_path, prepared.path)
+        ):
             raise ResumeTailoringError(
                 "AI-tailored resume approval is missing or no longer matches the exact file."
             )

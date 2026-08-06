@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted - 2026-08-05
+Accepted - 2026-08-05. The mandatory-review portion is superseded by
+[ADR 0003](0003-explicit-ai-review-policy.md); all evidence and document-integrity requirements
+remain accepted.
 
 ## Context
 

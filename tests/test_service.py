@@ -11,7 +11,12 @@ from docx import Document
 
 from core.resumes.bullet_curator import EditableBullet
 from core.resumes.documents import SkillSlot
-from core.resumes.models import JobPosting, ResumeConfigurationError, ResumeTailoringError
+from core.resumes.models import (
+    AIReviewPolicy,
+    JobPosting,
+    ResumeConfigurationError,
+    ResumeTailoringError,
+)
 from core.resumes.service import ResumeService
 
 
@@ -525,7 +530,7 @@ def test_ai_bullets_pre_upload_guard_rejects_post_approval_change(tmp_path: Path
     )
     result = service.prepare(job)
     assert result.prepared is not None
-    expected_digest = service.assert_prepared_resume_approved(job, result.prepared)
+    expected_digest = service.assert_prepared_resume_ready(job, result.prepared)
     assert expected_digest == hashlib.sha256(result.prepared.path.read_bytes()).hexdigest()
 
     tampered = Document(result.prepared.path)
@@ -533,4 +538,84 @@ def test_ai_bullets_pre_upload_guard_rejects_post_approval_change(tmp_path: Path
     tampered.save(result.prepared.path)
 
     with pytest.raises(ResumeTailoringError, match="changed after validation"):
-        service.assert_prepared_resume_approved(job, result.prepared)
+        service.assert_prepared_resume_ready(job, result.prepared)
+
+
+def test_ai_bullets_skip_review_never_calls_callback_or_requires_approval(
+    tmp_path: Path,
+) -> None:
+    source = make_ai_resume(tmp_path / "base.docx")
+
+    def forbidden_review(job: JobPosting, path: Path, digest: str) -> bool:
+        raise AssertionError("skip_review must never invoke the review callback")
+
+    service = ResumeService.from_settings(
+        {
+            "resume_mode": "ai_bullets",
+            "ai_review_policy": "skip_review",
+            "ai_resume_path": str(source),
+            "ai_resume_output_dir": str(tmp_path / "ai-out"),
+            "minimum_match_score": 20,
+        },
+        bullet_planner=AIBulletPlanner(),
+        layout_verifier=lambda source_path, output_path: None,
+        review_callback=forbidden_review,
+    )
+    job = JobPosting(
+        title="AWS Data Engineer",
+        description="Required: AWS, Python, and SQL data pipeline experience.",
+        url="https://www.dice.com/job-detail/ai-skip-review",
+    )
+
+    result = service.prepare(job)
+
+    assert result.eligible and result.prepared is not None
+    assert (
+        service.assert_prepared_resume_ready(job, result.prepared)
+        == hashlib.sha256(result.prepared.path.read_bytes()).hexdigest()
+    )
+    assert not list((tmp_path / "ai-out").glob("*.approval.json"))
+
+
+def test_ai_bullets_skip_review_guard_still_rejects_tampering(tmp_path: Path) -> None:
+    source = make_ai_resume(tmp_path / "base.docx")
+    service = ResumeService.from_settings(
+        {
+            "resume_mode": "ai_bullets",
+            "ai_review_policy": AIReviewPolicy.SKIP_REVIEW.value,
+            "ai_resume_path": str(source),
+            "ai_resume_output_dir": str(tmp_path / "ai-out"),
+            "minimum_match_score": 20,
+        },
+        bullet_planner=AIBulletPlanner(),
+        layout_verifier=lambda source_path, output_path: None,
+    )
+    job = JobPosting(
+        title="AWS Data Engineer",
+        description="Required: AWS, Python, and SQL data pipeline experience.",
+        url="https://www.dice.com/job-detail/ai-skip-review-tamper",
+    )
+    result = service.prepare(job)
+    assert result.prepared is not None
+
+    tampered = Document(result.prepared.path)
+    tampered.paragraphs[0].text = "Changed after validation"
+    tampered.save(result.prepared.path)
+
+    with pytest.raises(ResumeTailoringError, match="changed after validation"):
+        service.assert_prepared_resume_ready(job, result.prepared)
+
+
+@pytest.mark.parametrize("value", ["unchecked", "", 7, None])
+def test_invalid_ai_review_policy_fails_closed(
+    resume_factory,
+    value: object,
+) -> None:  # type: ignore[no-untyped-def]
+    with pytest.raises(ResumeConfigurationError, match="review policy|ai_review_policy"):
+        ResumeService.from_settings(
+            {
+                "resume_mode": "static",
+                "resume_paths": make_paths(resume_factory),
+                "ai_review_policy": value,
+            }
+        )

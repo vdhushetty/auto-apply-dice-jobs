@@ -26,13 +26,17 @@ navigation and retrieval, inaccurate resume content, and keyword stuffing. See t
   existing experience bullets. At most two net-new bullets may be produced by splitting supported
   source material. Local validation rejects technologies or quantified claims absent from the
   cited same-role bullets and locks every non-target paragraph and structural feature. The prompt
-  and exact-file human review additionally prohibit invented experience, employers, dates,
-  education, or other candidate facts. The generated DOCX must keep the source page count and is
-  opened for explicit approval before it can be uploaded.
+  prohibits invented experience, employers, dates, education, or other candidate facts. The
+  generated DOCX must keep the source page count. Before starting, the user explicitly chooses
+  **Review before apply** or **Skip review**.
 
 Static and tailored modes require exactly three user-approved files labelled AWS, Azure, and GCP.
 AI bullet tailoring uses one user-approved DOCX. No personal resume files are included in the
 repository.
+
+The AI review policy changes only human inspection. **Review before apply** opens each exact
+generated DOCX and requires approval before upload. **Skip review** omits that prompt, but keeps
+all evidence, structure, page-count, matching, upload-filename, form, and confirmation checks.
 
 ## Current safety behavior
 
@@ -41,7 +45,8 @@ The application skips instead of submitting when any of these checks fail:
 - the job description cannot be read;
 - the best resume score is below the configured threshold;
 - tailored output is refused, malformed, unchanged, or structurally unsafe;
-- AI bullet output lacks candidate evidence, changes protected content/layout, or is not approved;
+- AI bullet output lacks candidate evidence, changes protected content/layout, or cannot satisfy
+  the selected review policy;
 - the posting leaves Dice instead of entering Dice Easy Apply;
 - the intended filename cannot be verified in a file input; or
 - Dice does not visibly confirm submission.
@@ -108,13 +113,16 @@ In **Settings**:
 4. Select and validate either one AWS/Azure/GCP set or one base DOCX. For AI bullet tailoring,
    enter an API key; selecting the save checkbox writes it only to the ignored `.env` with local
    file permissions, never to settings JSON.
-5. Choose the minimum match score, winner margin, and a small job limit.
-6. Save settings. Personal paths are written atomically to ignored
+5. In AI bullet mode, explicitly choose **Review before apply** (the safe default) or
+   **Skip review**. The selected stable policy is saved in the ignored local settings file.
+6. Choose the minimum match score, winner margin, and a small job limit.
+7. Save settings. Personal paths are written atomically to ignored
    `config/settings.local.json` with local-only permissions.
-7. Start the bot and review the mode-specific confirmation.
+8. Start the bot and read the mode-specific confirmation. It repeats the selected AI review
+   policy; Verify Upload may leave a Dice draft.
 
 Generated skill-order files are kept under ignored `.data/tailored_resumes/`; AI bullet files and
-hash-bound review approvals are kept under ignored `.data/ai_resumes/`. Consolidated,
+any hash-bound review approvals are kept under ignored `.data/ai_resumes/`. Consolidated,
 run-scoped Excel and JSON reports are written under ignored `.data/runs/`.
 
 ## Development and validation
@@ -167,6 +175,7 @@ Architecture, development, and risk details live in:
 - [Security and privacy](docs/security.md)
 - [Sample resume validation](docs/sample-validation.md)
 - [Curation safety decision](docs/decisions/0001-truth-preserving-curation.md)
+- [Explicit AI review policy decision](docs/decisions/0003-explicit-ai-review-policy.md)
 
 ## Known limitations
 
@@ -176,8 +185,9 @@ Architecture, development, and risk details live in:
   employment history, dates, metrics, education, or certifications.
 - AI bullet tailoring can rephrase or split only experience bullets backed by existing resume
   facts. Its prompt forbids manufacturing experience, technologies, numbers, employers, dates,
-  education, or certifications; deterministic evidence checks and mandatory exact-file human
-  review fail closed before upload.
+  education, or certifications. Deterministic evidence and document checks fail closed before
+  upload in both review policies. **Skip review** cannot verify whether the user agrees with the
+  wording, so use it only after testing Review before apply on representative jobs.
 - Tailored mode requires parseable delimiter-based skill lists in DOCX files. Complex text boxes,
   content controls, tracked changes, or scanned documents are not supported.
 - The matcher uses a version-controlled technology taxonomy and a lexical signal. The eval set is

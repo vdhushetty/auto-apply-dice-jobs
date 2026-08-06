@@ -763,8 +763,8 @@ def apply_to_job_url(
         if isinstance(job, dict):
             job["Tailored Resume"] = bool(preparation.prepared.tailored)
 
-        def assert_prepared_resume_approved() -> None:
-            guard = getattr(resume_service, "assert_prepared_resume_approved", None)
+        def assert_prepared_resume_ready() -> None:
+            guard = getattr(resume_service, "assert_prepared_resume_ready", None)
             if callable(guard):
                 guard(posting, preparation.prepared)
 
@@ -781,7 +781,7 @@ def apply_to_job_url(
             apply_control,
         )
         try:
-            assert_prepared_resume_approved()
+            assert_prepared_resume_ready()
         except ResumeTailoringError as exc:
             result = ApplicationResult(
                 ApplicationStatus.SKIPPED,
@@ -829,7 +829,7 @@ def apply_to_job_url(
                     found_input, upload_succeeded = _upload_resume_if_present(
                         driver,
                         str(prepared_path),
-                        pre_upload=assert_prepared_resume_approved,
+                        pre_upload=assert_prepared_resume_ready,
                     )
                 except ResumeTailoringError as exc:
                     result = ApplicationResult(
@@ -906,7 +906,7 @@ def apply_to_job_url(
                     "arguments[0].scrollIntoView({block: 'center'});", submit_button
                 )
                 try:
-                    assert_prepared_resume_approved()
+                    assert_prepared_resume_ready()
                 except ResumeTailoringError as exc:
                     result = ApplicationResult(
                         ApplicationStatus.SKIPPED,
@@ -961,7 +961,7 @@ def apply_to_job_url(
                     )
                     return result
                 try:
-                    assert_prepared_resume_approved()
+                    assert_prepared_resume_ready()
                 except ResumeTailoringError as exc:
                     result = ApplicationResult(
                         ApplicationStatus.SKIPPED,

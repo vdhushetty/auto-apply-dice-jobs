@@ -2,6 +2,7 @@
 
 from .catalog import ResumeInspection, inspect_resume_catalog
 from .models import (
+    AIReviewPolicy,
     CloudProfile,
     CustomProfile,
     JobPosting,
@@ -13,6 +14,7 @@ from .models import (
 from .service import ResumeService
 
 __all__ = [
+    "AIReviewPolicy",
     "CloudProfile",
     "CustomProfile",
     "JobPosting",

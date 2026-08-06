@@ -227,11 +227,11 @@ class GuardedPreparedService(PreparedService):
     fail_on_guard_call: int = 1
     guard_calls: int = 0
 
-    def assert_prepared_resume_approved(self, job, prepared):  # type: ignore[no-untyped-def]
+    def assert_prepared_resume_ready(self, job, prepared):  # type: ignore[no-untyped-def]
         self.guard_calls += 1
         if self.guard_calls == self.fail_on_guard_call:
-            raise ResumeTailoringError("AI resume hash no longer matches its approval.")
-        return "approved-digest"
+            raise ResumeTailoringError("AI resume integrity check no longer matches.")
+        return "ready-digest"
 
 
 @dataclass
@@ -410,7 +410,7 @@ def test_verify_upload_never_clicks_next_or_submit(monkeypatch, tmp_path: Path) 
     assert driver.current_url == "https://www.dice.com/jobs?q=data"
 
 
-def test_approval_drift_before_apply_is_skipped(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+def test_integrity_drift_before_apply_is_skipped(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
     resume = tmp_path / "ai.docx"
     resume.touch()
     driver = WizardDriver(has_file_input=True)
@@ -425,13 +425,13 @@ def test_approval_drift_before_apply_is_skipped(monkeypatch, tmp_path: Path) -> 
     result = apply_to_job_url(driver, job, service)  # type: ignore[arg-type]
 
     assert result.status is ApplicationStatus.SKIPPED
-    assert "hash no longer matches" in result.reason
+    assert "integrity check no longer matches" in result.reason
     assert service.guard_calls == 1
     assert not driver.apply_control.clicked
     assert driver.file_input is not None and not driver.file_input.selected_file_name
 
 
-def test_approval_drift_immediately_before_upload_is_skipped(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+def test_integrity_drift_immediately_before_upload_is_skipped(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
     resume = tmp_path / "ai.docx"
     resume.touch()
     driver = WizardDriver(has_file_input=True)
@@ -446,13 +446,13 @@ def test_approval_drift_immediately_before_upload_is_skipped(monkeypatch, tmp_pa
     result = apply_to_job_url(driver, job, service)  # type: ignore[arg-type]
 
     assert result.status is ApplicationStatus.SKIPPED
-    assert "hash no longer matches" in result.reason
+    assert "integrity check no longer matches" in result.reason
     assert service.guard_calls == 2
     assert driver.apply_control.clicked
     assert driver.file_input is not None and not driver.file_input.selected_file_name
 
 
-def test_approval_is_checked_after_browser_filename_verification(
+def test_integrity_is_checked_after_browser_filename_verification(
     monkeypatch, tmp_path: Path
 ) -> None:  # type: ignore[no-untyped-def]
     resume = tmp_path / "ai.docx"
@@ -479,7 +479,7 @@ def test_approval_is_checked_after_browser_filename_verification(
     assert not driver.submit_button.clicked
 
 
-def test_approval_is_checked_again_immediately_before_submit(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+def test_integrity_is_checked_again_immediately_before_submit(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
     resume = tmp_path / "ai.docx"
     resume.touch()
     driver = WizardDriver(has_file_input=True)

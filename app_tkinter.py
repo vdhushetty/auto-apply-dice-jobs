@@ -29,6 +29,13 @@ from core.resumes import ResumeService, inspect_resume_catalog
 from core.resumes.models import CloudProfile, ResumeError
 
 
+AI_REVIEW_POLICY_LABELS = {
+    "review_before_apply": "Review before apply",
+    "skip_review": "Skip review",
+}
+AI_REVIEW_POLICY_VALUES = {label: value for value, label in AI_REVIEW_POLICY_LABELS.items()}
+
+
 class DiceAutoBotApp:
     def __init__(self, root):
         self.root = root
@@ -168,6 +175,7 @@ class DiceAutoBotApp:
         self.ai_resume_path = ""
         self.ai_resume_output_dir = ".data/ai_resumes"
         self.openai_model = "gpt-5.6-sol"
+        self.ai_review_policy = "review_before_apply"
 
         # Try to load from file if it exists
         import json
@@ -209,6 +217,16 @@ class DiceAutoBotApp:
             or str(config.get("openai_model", self.openai_model)).strip()
             or "gpt-5.6-sol"
         )
+        configured_review_policy = str(
+            config.get("ai_review_policy", self.ai_review_policy)
+        ).strip()
+        if configured_review_policy in AI_REVIEW_POLICY_LABELS:
+            self.ai_review_policy = configured_review_policy
+        else:
+            self.logger.warning(
+                "Unknown AI review policy in settings; defaulting to review_before_apply"
+            )
+            self.ai_review_policy = "review_before_apply"
         self.logger.info("Configuration loaded successfully")
 
     def save_config(self):
@@ -221,6 +239,11 @@ class DiceAutoBotApp:
             api_key = self.openai_api_key_entry.get().strip()
             if self.persist_openai_key_var.get() and not api_key:
                 raise ValueError("Enter an OpenAI API key before choosing to save it.")
+            ai_review_policy = self.selected_ai_review_policy()
+            if self.resume_mode_var.get() == "ai_bullets" and not ai_review_policy:
+                raise ValueError(
+                    "Choose Review before apply or Skip review before saving AI bullet settings."
+                )
             config = {
                 "search_queries": [
                     q.strip() for q in self.search_query_entry.get().split(",") if q.strip()
@@ -245,6 +268,7 @@ class DiceAutoBotApp:
                 "ai_resume_path": self.ai_resume_path_var.get().strip(),
                 "ai_resume_output_dir": self.ai_resume_output_dir,
                 "openai_model": self.openai_model_var.get().strip() or "gpt-5.6-sol",
+                "ai_review_policy": ai_review_policy or "review_before_apply",
             }
 
             temporary_config = f"{self.local_config_file}.tmp"
@@ -640,6 +664,27 @@ class DiceAutoBotApp:
         ttk.Entry(model_row, textvariable=self.openai_model_var, width=30).pack(side="left")
         ttk.Label(model_row, text="(OPENAI_MODEL overrides this setting)").pack(side="left", padx=5)
 
+        review_policy_row = ttk.Frame(self.ai_options_frame)
+        review_policy_row.pack(fill="x", padx=5, pady=3)
+        ttk.Label(review_policy_row, text="AI review policy:", width=16).pack(side="left")
+        self.ai_review_policy_label_var = tk.StringVar(
+            value=AI_REVIEW_POLICY_LABELS.get(self.ai_review_policy, "")
+        )
+        review_policy_combo = ttk.Combobox(
+            review_policy_row,
+            textvariable=self.ai_review_policy_label_var,
+            values=tuple(AI_REVIEW_POLICY_LABELS.values()),
+            state="readonly",
+            width=22,
+        )
+        review_policy_combo.pack(side="left")
+        review_policy_combo.bind("<<ComboboxSelected>>", self.on_ai_review_policy_changed)
+        self.ai_review_policy_help_label = ttk.Label(
+            self.ai_options_frame,
+            wraplength=740,
+        )
+        self.ai_review_policy_help_label.pack(anchor="w", padx=5, pady=(0, 3))
+
         self.persist_openai_key_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             self.ai_options_frame,
@@ -719,9 +764,9 @@ How to Use This Application
 2. Enter job titles to search for (separated by commas)
 3. Optionally specify include/exclude keywords to filter results
 4. Configure either three cloud resumes or one base DOCX for AI bullet tailoring
-5. Run Preview first; it never clicks Apply
-6. AI bullet mode opens every generated DOCX for explicit approval before upload
-7. Use Verify Upload for one supervised filename check
+5. For AI bullet mode, choose Review before apply or Skip review before starting
+6. Run Preview first; it never clicks Apply
+7. Use Verify Upload for one supervised filename check; Dice may retain a draft
 8. Use Submit only after reviewing preview results
 
 Understanding Keywords
@@ -757,6 +802,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
         if openai_api_key:
             self.openai_api_key_entry.insert(0, openai_api_key)
         self.on_run_mode_changed()
+        self.on_ai_review_policy_changed()
         self.on_resume_mode_changed()
 
     def on_run_mode_changed(self, _event=None):
@@ -800,8 +846,8 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             self.resume_mode_help_label.config(
                 text=(
                     "AI bullet tailoring uses one DOCX, rewrites only supported experience "
-                    "bullets, preserves non-target structure and page count, and requires "
-                    "your explicit review before any upload."
+                    "bullets, and preserves non-target structure and page count. Choose the "
+                    "AI review policy before starting automation."
                 )
             )
             if self.ai_resume_path_var.get().strip().lower().endswith(".pdf"):
@@ -838,6 +884,26 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                     "the selected source file unchanged."
                 )
             )
+
+    def selected_ai_review_policy(self):
+        """Return the stable value for the selected user-facing review-policy label."""
+
+        return AI_REVIEW_POLICY_VALUES.get(self.ai_review_policy_label_var.get().strip(), "")
+
+    def on_ai_review_policy_changed(self, _event=None):
+        """Explain exactly what the selected AI review policy changes."""
+
+        policy = self.selected_ai_review_policy()
+        if policy == "review_before_apply":
+            help_text = "Every generated DOCX opens for your approval before it can be uploaded."
+        elif policy == "skip_review":
+            help_text = (
+                "Skips only human inspection of generated bullets. Evidence, structure, "
+                "layout, matching, and upload-integrity checks still run."
+            )
+        else:
+            help_text = "Choose a review policy before starting AI bullet automation."
+        self.ai_review_policy_help_label.config(text=help_text)
 
     def browse_resume_file(self, profile):
         """Select one local resume without copying it into the repository."""
@@ -932,6 +998,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                 or self.openai_model_var.get().strip()
                 or "gpt-5.6-sol"
             ),
+            "ai_review_policy": self.selected_ai_review_policy(),
         }
 
     def review_ai_resume(self, job, generated_path, output_sha256):
@@ -1149,6 +1216,16 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
 
         resume_settings = self.resume_settings_snapshot()
         run_mode = RunMode(self.run_mode_var.get())
+        if (
+            resume_settings["resume_mode"] == "ai_bullets"
+            and not resume_settings["ai_review_policy"]
+        ):
+            messagebox.showerror(
+                "AI Review Policy Required",
+                "Choose Review before apply or Skip review before starting automation.",
+            )
+            self.notebook.select(1)
+            return
         openai_api_key = self.openai_api_key_entry.get().strip()
         if (
             resume_settings["resume_mode"] == "ai_bullets"
@@ -1208,6 +1285,25 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                 f"{resume_settings['resume_mode']} resume mode. Continue?",
             ),
         }[run_mode]
+        if resume_settings["resume_mode"] == "ai_bullets":
+            review_policy = resume_settings["ai_review_policy"]
+            review_label = AI_REVIEW_POLICY_LABELS[review_policy]
+            if review_policy == "review_before_apply":
+                review_warning = (
+                    f"AI review policy: {review_label}. Every generated DOCX must be opened "
+                    "and approved before upload."
+                )
+            else:
+                review_warning = (
+                    f"AI review policy: {review_label}. Skip review bypasses only human "
+                    "inspection of the generated resume; evidence, document-integrity, "
+                    "layout, matching, and upload checks remain enabled."
+                )
+            if run_mode is RunMode.PREVIEW:
+                review_warning += " Preview does not generate or upload a resume."
+            elif run_mode is RunMode.VERIFY_UPLOAD:
+                review_warning += " Verify Upload may leave a Dice draft."
+            confirmation = (confirmation[0], f"{confirmation[1]}\n\n{review_warning}")
         if not messagebox.askyesno(
             confirmation[0],
             confirmation[1],

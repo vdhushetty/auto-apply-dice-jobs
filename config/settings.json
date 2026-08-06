@@ -58,5 +58,6 @@
     "minimum_winner_margin": 5,
     "tailored_resume_output_dir": ".data/tailored_resumes",
     "ai_resume_output_dir": ".data/ai_resumes",
-    "openai_model": "gpt-5.6-sol"
+    "openai_model": "gpt-5.6-sol",
+    "ai_review_policy": "review_before_apply"
 }
