@@ -128,7 +128,10 @@ In **Settings**:
    file permissions, never to settings JSON.
 5. In AI bullet mode, explicitly choose **Review before apply** (the safe default) or
    **Skip review**. The selected stable policy is saved in the ignored local settings file.
-6. Choose the minimum match score, winner margin, and a small job limit.
+6. Choose the minimum match score, winner margin, and 1–15 confirmed applications per role.
+   Submit mode searches and completes Data Engineer results first, then Data Analyst, Machine
+   Learning, AI/ML, GenAI, and Agentic AI. It records confirmed/already-applied jobs locally so
+   later runs skip them and continue with new or previously unapplied search results.
 7. Save settings. Personal paths are written atomically to ignored
    `config/settings.local.json` with local-only permissions.
 8. Start the bot and read the mode-specific confirmation. It repeats the selected AI review

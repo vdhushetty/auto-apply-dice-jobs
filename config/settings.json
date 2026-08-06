@@ -45,7 +45,7 @@
         "llm"
     ],
     "headless_mode": false,
-    "job_application_limit": 25,
+    "job_application_limit": 10,
     "run_mode": "preview",
     "resume_mode": "static",
     "resume_paths": {

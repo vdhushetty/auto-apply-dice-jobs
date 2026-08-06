@@ -324,7 +324,7 @@ class DiceAutoBotApp:
             "llm",
         ]
         self.headless_mode = False
-        self.job_limit = 25
+        self.job_limit = 10
         self.run_mode = "preview"
         self.resume_mode = "static"
         self.resume_paths = {"aws": "", "azure": "", "gcp": ""}
@@ -800,10 +800,10 @@ class DiceAutoBotApp:
         # Job limit
         limit_frame = ttk.Frame(settings_frame)
         limit_frame.pack(fill="x", padx=10, pady=5)
-        ttk.Label(limit_frame, text="Maximum jobs to apply for:").pack(side="left")
+        ttk.Label(limit_frame, text="Maximum confirmed applications per role:").pack(side="left")
         self.job_limit_var = tk.IntVar(value=self.job_limit)
         job_limit_spin = ttk.Spinbox(
-            limit_frame, from_=1, to=100, width=5, textvariable=self.job_limit_var
+            limit_frame, from_=1, to=15, width=5, textvariable=self.job_limit_var
         )
         job_limit_spin.pack(side="left", padx=5)
 
@@ -1556,8 +1556,8 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
         except (TypeError, ValueError, tk.TclError):
             messagebox.showerror("Job Limit", "Job limit must be a whole number from 1 to 100.")
             return
-        if not 1 <= job_limit <= 100:
-            messagebox.showerror("Job Limit", "Job limit must be between 1 and 100.")
+        if not 1 <= job_limit <= 15:
+            messagebox.showerror("Job Limit", "Applications per role must be between 1 and 15.")
             return
         if run_mode is RunMode.VERIFY_UPLOAD:
             job_limit = 1

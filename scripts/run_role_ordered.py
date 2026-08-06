@@ -23,14 +23,13 @@ from core.main_script import (
     ApplicationStatus,
     RunMode,
     apply_to_job_url,
-    candidate_bucket_limits,
     fetch_jobs_with_requests,
     get_web_driver,
-    rank_eligible_jobs,
 )
 from core.resumes import ResumeService
 
 LEDGER_PATH = Path(".data/role_ordered_runs/ledger.jsonl")
+_CANDIDATE_POOL_MULTIPLIER = 4
 
 
 def _load_settings() -> dict[str, Any]:
@@ -50,7 +49,10 @@ def _recorded_applied_urls(path: Path) -> set[str]:
             entry = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if entry.get("status") == ApplicationStatus.APPLIED.value:
+        if entry.get("status") in {
+            ApplicationStatus.APPLIED.value,
+            ApplicationStatus.ALREADY_APPLIED.value,
+        }:
             url = entry.get("job_url")
             if isinstance(url, str) and url:
                 urls.add(url)
@@ -87,7 +89,7 @@ def run(
     event_callback: Callable[[Mapping[str, Any]], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> int:
-    """Apply to at most ``limit`` new, Dice-confirmed jobs in configured query order."""
+    """Apply to at most ``limit`` new jobs for each configured role, in result order."""
 
     if limit < 1:
         raise ValueError("limit must be at least 1")
@@ -114,25 +116,23 @@ def run(
 
     known_applied = _recorded_applied_urls(ledger_path)
     seen_urls = set(known_applied)
-    budgets = candidate_bucket_limits(len(queries), application_limit=limit)
     submitted = 0
     driver = get_web_driver(headless=False)
     try:
         authenticated, _ = authenticate_dice_session(driver, (username, password))
         if not authenticated:
             raise RuntimeError("Dice authentication was not confirmed.")
-        for index, query in enumerate(queries):
+        for query in queries:
             if cancel_requested is not None and cancel_requested():
                 break
-            if submitted >= limit:
-                break
+            role_submitted = 0
             jobs, _ = fetch_jobs_with_requests(
                 driver,
                 query,
                 settings.get("include_keywords"),
                 settings.get("exclude_keywords"),
                 max_pages=2,
-                max_included_jobs=budgets[index],
+                max_included_jobs=limit * _CANDIDATE_POOL_MULTIPLIER,
             )
             fresh_jobs = []
             for job in jobs:
@@ -141,17 +141,10 @@ def run(
                     seen_urls.add(url)
                     job["Search Query"] = query
                     fresh_jobs.append(job)
-            selection = rank_eligible_jobs(
-                driver,
-                fresh_jobs,
-                service,
-                limit=max(1, limit - submitted),
-                cancel_requested=cancel_requested,
-            )
-            for job in (*selection.selected_jobs, *selection.deferred_jobs):
+            for job in fresh_jobs:
                 if cancel_requested is not None and cancel_requested():
                     break
-                if submitted >= limit:
+                if role_submitted >= limit:
                     break
                 result = apply_to_job_url(
                     driver,
@@ -167,9 +160,10 @@ def run(
                     event_callback(entry)
                 if result.status is ApplicationStatus.APPLIED:
                     submitted += 1
+                    role_submitted += 1
     finally:
         driver.quit()
-    print(json.dumps({"submitted": submitted, "cap": limit}), flush=True)
+    print(json.dumps({"submitted": submitted, "per_role_cap": limit}), flush=True)
     return submitted
 
 
