@@ -82,6 +82,39 @@ class AIBulletPlanner:
         }
 
 
+class RetryingAIBulletPlanner(AIBulletPlanner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.retry_calls = 0
+
+    def plan(self, job: JobPosting, bullets: Sequence[EditableBullet]) -> dict[str, Any]:
+        self.calls += 1
+        target = bullets[1]
+        return {
+            "schema_version": "1",
+            "outcome": "rewrite",
+            "reason_code": "ok",
+            "job_evidence": [{"quote": "AWS", "priority": "required"}],
+            "edits": [
+                {
+                    "bullet_id": target.bullet_id,
+                    "replacement_bullets": [
+                        "Automated AWS data quality checks and monitored production batch workflows."
+                    ],
+                    "source_bullet_ids": [target.bullet_id],
+                }
+            ],
+        }
+
+    def retry_plan(
+        self,
+        job: JobPosting,
+        bullets: Sequence[EditableBullet],
+    ) -> dict[str, Any]:
+        self.retry_calls += 1
+        return super().plan(job, bullets)
+
+
 class ExplodingAIBulletPlanner:
     model = "fake-ai-model"
 
@@ -395,6 +428,34 @@ def test_ai_bullets_uses_one_resume_and_hash_bound_review(tmp_path: Path) -> Non
         for path in (approval, first.prepared.path.with_suffix(".docx.manifest.json"))
     )
     assert "sk-test-secret-not-real" not in artifact_text
+
+
+def test_ai_bullets_retries_one_source_ungrounded_technology_plan(tmp_path: Path) -> None:
+    source = make_ai_resume(tmp_path / "base.docx")
+    planner = RetryingAIBulletPlanner()
+    service = ResumeService.from_settings(
+        {
+            "resume_mode": "ai_bullets",
+            "ai_review_policy": "skip_review",
+            "ai_resume_path": str(source),
+            "ai_resume_output_dir": str(tmp_path / "ai-out"),
+            "minimum_match_score": 20,
+        },
+        bullet_planner=planner,
+        layout_verifier=lambda source_path, output_path: None,
+    )
+    job = JobPosting(
+        title="AWS Data Engineer",
+        description="Required: AWS, Python, and SQL data pipeline experience.",
+        url="https://www.dice.com/job-detail/ai-source-grounded-retry",
+    )
+
+    result = service.prepare(job)
+
+    assert result.eligible and result.prepared is not None
+    assert planner.calls == 2
+    assert planner.retry_calls == 1
+    assert source.exists()
 
 
 def test_ai_bullets_review_rejection_skips_upload_candidate(tmp_path: Path) -> None:

@@ -194,6 +194,24 @@ class OpenAIBulletRewritePlanner:
         )
 
     def plan(self, job: JobPosting, bullets: Sequence[EditableBullet]) -> Mapping[str, Any]:
+        return self._request_plan(job, bullets)
+
+    def retry_plan(
+        self,
+        job: JobPosting,
+        bullets: Sequence[EditableBullet],
+    ) -> Mapping[str, Any]:
+        """Request one conservative repair after local evidence validation rejects a plan."""
+
+        return self._request_plan(job, bullets, conservative_retry=True)
+
+    def _request_plan(
+        self,
+        job: JobPosting,
+        bullets: Sequence[EditableBullet],
+        *,
+        conservative_retry: bool = False,
+    ) -> Mapping[str, Any]:
         if not 1 <= len(bullets) <= MAX_EDITABLE_BULLETS:
             raise ResumeTailoringError("Editable resume bullets are missing or exceed the limit.")
         if len({bullet.bullet_id for bullet in bullets}) != len(bullets) or any(
@@ -237,8 +255,18 @@ class OpenAIBulletRewritePlanner:
             "bullets. Across the plan add no more than two net-new bullets. Preserve meaning, "
             "tense, and approximate length; return bullet text without list markers. Job evidence "
             "quotes must be exact verbatim substrings of the supplied title or description. "
+            "Every technology term in a replacement must appear in that edit's cited source "
+            "bullet text; do not import a technology from the job posting or another resume "
+            "bullet. "
             "Return no_safe_plan when a useful change cannot be made within these constraints."
         )
+        if conservative_retry:
+            instructions += (
+                " A previous proposal was rejected by the local evidence validator. Produce a "
+                "new independent plan with especially conservative wording. If a cited source "
+                "does not explicitly name a technology, omit that technology rather than "
+                "inferring it."
+            )
         try:
             response = self._client.responses.create(
                 model=self.model,

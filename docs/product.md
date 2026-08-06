@@ -35,6 +35,8 @@ Dice account, every source resume, and every factual claim in them.
 - AI bullet mode uses a single-resume deterministic title + full-description score, rewrites only
   bounded experience bullets supported by the source resume, preserves every protected section
   and structural feature, and enforces the selected review policy before upload.
+- If an AI bullet plan introduces a technology absent from its cited source bullets, the app makes
+  one more conservative, source-bound request; a second invalid plan is skipped.
 - `review_before_apply` is the default and requires approval of the exact generated hash before
   upload. `skip_review` bypasses only that human-inspection prompt; all deterministic generation,
   evidence, structure, layout, relevance, upload, form, and confirmation checks remain active.

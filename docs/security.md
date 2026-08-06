@@ -23,6 +23,8 @@ answering or accepting screening questions and consents on the user's behalf.
 - `.env` contains Dice credentials and optionally an OpenAI key; it is ignored and must remain
   local with restrictive file permissions. The masked API-key field is persisted only when its
   explicit checkbox is selected; the key never enters settings JSON, manifests, reports, or logs.
+- A rejected AI bullet plan may receive one conservative retry, but each response is validated
+  locally against the exact cited source bullets before any DOCX is created or uploaded.
 - `config/settings.local.json` contains personal paths and the selected non-secret AI review
   policy; it is ignored.
 - Source resumes and generated `.data/` files contain PII and must not enter Git, fixtures, logs,

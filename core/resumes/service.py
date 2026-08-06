@@ -68,6 +68,9 @@ from .selector import (
 DEFAULT_THRESHOLD = 35.0
 DEFAULT_OUTPUT_DIR = Path(".data/tailored_resumes")
 DEFAULT_AI_OUTPUT_DIR = Path(".data/ai_resumes")
+_RETRYABLE_AI_BULLET_VALIDATION_ERROR = (
+    "Bullet rewrite introduced a technology absent from its cited source bullets."
+)
 LayoutVerifier = Callable[[Path, Path], None]
 ReviewCallback = Callable[[JobPosting, Path, str], bool]
 
@@ -428,7 +431,31 @@ class ResumeService:
         source_text = next(
             variant.text for variant in self._variants if variant.path == source_path
         )
-        plan = validate_bullet_rewrite_plan(raw_plan, job, bullets, source_text)
+        try:
+            plan = validate_bullet_rewrite_plan(raw_plan, job, bullets, source_text)
+        except ResumeTailoringError as first_error:
+            retry_plan = getattr(self._bullet_planner, "retry_plan", None)
+            if str(first_error) != _RETRYABLE_AI_BULLET_VALIDATION_ERROR or not callable(
+                retry_plan
+            ):
+                raise
+            try:
+                retry_raw_plan = retry_plan(job, bullets)
+                plan = validate_bullet_rewrite_plan(
+                    retry_raw_plan,
+                    job,
+                    bullets,
+                    source_text,
+                )
+            except ResumeTailoringError as retry_error:
+                raise ResumeTailoringError(
+                    "AI bullet rewrite remained unsupported by cited source bullets after one "
+                    "conservative retry."
+                ) from retry_error
+            except Exception as retry_error:
+                raise ResumeTailoringError(
+                    "OpenAI could not produce a conservative bullet rewrite retry."
+                ) from retry_error
         try:
             create_bullet_rewritten_docx(source_path, output_path, plan)
             validate_bullet_rewritten_docx(source_path, output_path, plan)

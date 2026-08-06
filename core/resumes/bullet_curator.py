@@ -10,7 +10,7 @@ from typing import Any, Protocol
 from .models import JobPosting, ResumeTailoringError
 from .selector import extract_technology_terms
 
-BULLET_REWRITE_PROMPT_VERSION = "resume-bullet-rewrite-v1"
+BULLET_REWRITE_PROMPT_VERSION = "resume-bullet-rewrite-v2"
 DEFAULT_BULLET_REWRITE_MODEL = "gpt-5.6-sol"
 MAX_EDITED_BULLETS = 4
 MAX_NET_NEW_BULLETS = 2
