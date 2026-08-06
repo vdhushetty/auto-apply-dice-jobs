@@ -172,6 +172,10 @@ class DiceAutoBotApp:
         self.root = root
         self.root.title("Dice Auto Apply Bot")
         self.root.geometry("900x700")
+        # Tk is not thread-safe on macOS. Browser and OpenAI workers enqueue callbacks here;
+        # only this main-loop drain is allowed to call Tk methods.
+        self._ui_callbacks = queue.SimpleQueue()
+        self.root.after(25, self._drain_ui_callbacks)
 
         # Set app icon if available
         try:
@@ -222,6 +226,29 @@ class DiceAutoBotApp:
 
         # Log that app is started
         self.logger.info("Application started")
+
+    def post_ui(self, callback):
+        """Queue a UI callback without calling Tk from a background thread."""
+
+        self._ui_callbacks.put(callback)
+
+    def _drain_ui_callbacks(self):
+        """Run bounded worker callbacks on Tk's main thread."""
+
+        for _ in range(100):
+            try:
+                callback = self._ui_callbacks.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except Exception:
+                self.logger.exception("A queued UI update failed")
+        try:
+            self.root.after(25, self._drain_ui_callbacks)
+        except tk.TclError:
+            # The window is closing; a pending worker callback must not revive it.
+            return
 
     def setup_logging(self):
         """Set up logging for the application"""
@@ -658,7 +685,7 @@ class DiceAutoBotApp:
         self.log_text.config(state="disabled")  # Make it read-only
 
         # Add a handler that redirects logs to this widget
-        self.log_handler = LogTextHandler(self.log_text)
+        self.log_handler = LogTextHandler(self.log_text, self.post_ui)
         self.log_handler.setLevel(logging.INFO)
         formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
         self.log_handler.setFormatter(formatter)
@@ -1220,7 +1247,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             finally:
                 completed.set()
 
-        self.root.after(0, open_and_prompt)
+        self.post_ui(open_and_prompt)
         review_deadline = time.monotonic() + (15 * 60)
         while not completed.wait(timeout=0.25):
             if not self.running or time.monotonic() >= review_deadline:
@@ -1694,8 +1721,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             )
             if not login_success:
                 show_current_stop("Login failed")
-                self.root.after(
-                    0,
+                self.post_ui(
                     lambda: messagebox.showerror(
                         "Login Failed", "Could not log in to Dice. Please check your credentials."
                     ),
@@ -1706,8 +1732,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                 refreshed_session_cookies = get_dice_session_cookies(driver)
             except Exception:
                 refreshed_session_cookies = ()
-            self.root.after(
-                0,
+            self.post_ui(
                 lambda fingerprint=credential_fingerprint, cookies=refreshed_session_cookies: (
                     self._remember_verified_login(fingerprint, cookies)
                 ),
@@ -1762,9 +1787,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
 
                 # Update the counter after each query, capturing the current count
                 count_to_display = current_count
-                self.root.after(
-                    0, lambda c=count_to_display: self.jobs_found_label.config(text=str(c))
-                )
+                self.post_ui(lambda c=count_to_display: self.jobs_found_label.config(text=str(c)))
 
                 # Print debug info
                 print(
@@ -1774,7 +1797,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             # Make sure the final count is displayed
             final_count = len(all_jobs)
             self.update_status(f"Found {final_count} unique jobs matching criteria")
-            self.root.after(0, lambda c=final_count: self.jobs_found_label.config(text=str(c)))
+            self.post_ui(lambda c=final_count: self.jobs_found_label.config(text=str(c)))
 
             # Check for already applied jobs
             self.update_status("Checking for already applied jobs...")
@@ -1794,8 +1817,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                 all_jobs, already_applied
             )
             already_applied_count = len(discovered_prior_applications)
-            self.root.after(
-                0,
+            self.post_ui(
                 lambda count=already_applied_count: self.jobs_already_applied_label.config(
                     text=str(count)
                 ),
@@ -1824,8 +1846,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                 if run_mode is RunMode.VERIFY_UPLOAD
                 else "Preflight reads and scores candidates; no upload yet."
             )
-            self.root.after(
-                0,
+            self.post_ui(
                 lambda message=preflight_message: self.current_step_label.config(text=message),
             )
             selection = rank_eligible_jobs(
@@ -1857,8 +1878,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             excluded_jobs.extend(selection.rejected_jobs)
             preflight_reason_counts = _preflight_rejection_counts(selection.rejected_jobs)
             skipped_count = sum(preflight_reason_counts.values())
-            self.root.after(
-                0,
+            self.post_ui(
                 lambda c=skipped_count: self.jobs_skipped_label.config(text=str(c)),
             )
             for reason, count in preflight_reason_counts.most_common():
@@ -1870,8 +1890,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                     f"Preflight skipped {skipped_count}; top reason ({top_reason_count}): "
                     f"{_safe_ui_message(top_reason)}"
                 )
-                self.root.after(
-                    0,
+                self.post_ui(
                     lambda summary=rejection_summary: self.last_result_label.config(text=summary),
                 )
             eligible_count = len(selection.selected_jobs) + len(selection.deferred_jobs)
@@ -1901,8 +1920,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                     f"{_safe_ui_message(top_reason)}"
                 )
                 self.update_status(no_upload_message)
-                self.root.after(
-                    0,
+                self.post_ui(
                     lambda message=no_upload_message: self.current_step_label.config(text=message),
                 )
 
@@ -1937,9 +1955,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
 
                 # Update both status and dedicated time label
                 self.update_status(f"Estimated completion time: {initial_estimate}")
-                self.root.after(
-                    0, lambda t=initial_estimate: self.estimated_time_label.config(text=t)
-                )
+                self.post_ui(lambda t=initial_estimate: self.estimated_time_label.config(text=t))
 
             # Variables for dynamic time estimation
             job_start_times = []
@@ -1955,7 +1971,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
 
                 # Update progress
                 progress = int((i / len(jobs_to_apply)) * 100) if jobs_to_apply else 0
-                self.root.after(0, lambda p=progress: self.progress_bar.config(value=p))
+                self.post_ui(lambda p=progress: self.progress_bar.config(value=p))
 
                 # Show job details in status
                 job_title = job.get("Job Title", "Unknown")
@@ -2010,16 +2026,15 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                         time_remaining += f"{remaining_seconds} seconds"
 
                         # Update the estimated time label
-                        self.root.after(
-                            0, lambda t=time_remaining: self.estimated_time_label.config(text=t)
+                        self.post_ui(
+                            lambda t=time_remaining: self.estimated_time_label.config(text=t)
                         )
 
                     if result.status is ApplicationStatus.APPLIED:
                         applied_count += 1
                         # Update applied count
                         count_to_display = applied_count
-                        self.root.after(
-                            0,
+                        self.post_ui(
                             lambda c=count_to_display: self.jobs_applied_label.config(text=str(c)),
                         )
 
@@ -2058,16 +2073,14 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                     }:
                         ready_count += 1
                         count_to_display = ready_count
-                        self.root.after(
-                            0,
+                        self.post_ui(
                             lambda c=count_to_display: self.jobs_ready_label.config(text=str(c)),
                         )
                         job["Applied"] = False
                     elif result.status is ApplicationStatus.ALREADY_APPLIED:
                         already_applied_count += 1
                         count_to_display = already_applied_count
-                        self.root.after(
-                            0,
+                        self.post_ui(
                             lambda c=count_to_display: self.jobs_already_applied_label.config(
                                 text=str(c)
                             ),
@@ -2076,8 +2089,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                     elif result.status is ApplicationStatus.SKIPPED:
                         skipped_count += 1
                         count_to_display = skipped_count
-                        self.root.after(
-                            0,
+                        self.post_ui(
                             lambda c=count_to_display: self.jobs_skipped_label.config(text=str(c)),
                         )
                         try:
@@ -2097,8 +2109,8 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                         failed_count += 1
                         # Update failed count
                         count_to_display = failed_count
-                        self.root.after(
-                            0, lambda c=count_to_display: self.jobs_failed_label.config(text=str(c))
+                        self.post_ui(
+                            lambda c=count_to_display: self.jobs_failed_label.config(text=str(c))
                         )
 
                         # Save to not applied jobs Excel file
@@ -2155,8 +2167,8 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                     run_results.append(dict(job))
                     # Update failed count
                     count_to_display = failed_count
-                    self.root.after(
-                        0, lambda c=count_to_display: self.jobs_failed_label.config(text=str(c))
+                    self.post_ui(
+                        lambda c=count_to_display: self.jobs_failed_label.config(text=str(c))
                     )
 
             # Compute execution time
@@ -2179,8 +2191,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                 last_attempt_reason=last_attempt_reason,
             )
             self.update_status(completion_summary)
-            self.root.after(
-                0,
+            self.post_ui(
                 lambda summary=completion_summary: (
                     self.current_step_label.config(text=summary),
                     self.last_result_label.config(text=summary),
@@ -2188,9 +2199,9 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             )
 
             # Final progress update
-            self.root.after(0, lambda: self.progress_bar.config(value=100))
+            self.post_ui(lambda: self.progress_bar.config(value=100))
             # Clear estimated time as we're done
-            self.root.after(0, lambda: self.estimated_time_label.config(text="Completed"))
+            self.post_ui(lambda: self.estimated_time_label.config(text="Completed"))
 
             # Save one consolidated, run-scoped report without job-description bodies.
             try:
@@ -2228,8 +2239,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                 self.logger.error(f"Error saving job data: {e}")
 
             # Show completion message
-            self.root.after(
-                0,
+            self.post_ui(
                 lambda: messagebox.showinfo(
                     "Process Complete",
                     f"{completion_summary}\n\n"
@@ -2248,8 +2258,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                 f"Run stopped after {type(e).__name__}: {error_message}"
             )
             show_current_stop(f"{type(e).__name__}: {error_message}")
-            self.root.after(
-                0,
+            self.post_ui(
                 lambda message=error_message: messagebox.showerror(
                     "Error", f"An error occurred: {message}"
                 ),
@@ -2280,7 +2289,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             self.start_button.config(state="normal")
             self.stop_button.config(state="disabled", text="Stop")
 
-        self.root.after(0, reset_controls)
+        self.post_ui(reset_controls)
 
     def show_application_progress(self, event, current, total):
         """Surface one secret-free browser milestone in labels and the live log."""
@@ -2314,7 +2323,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
                 self.last_result_label.config(text=last_result)
             self.status_label.config(text=f"{job_text} — {event.message}")
 
-        self.root.after(0, update_labels)
+        self.post_ui(update_labels)
 
     def show_stop_summary(
         self,
@@ -2351,21 +2360,22 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             self.jobs_skipped_label.config(text=str(skipped))
             self.jobs_failed_label.config(text=str(failed))
 
-        self.root.after(0, update_labels)
+        self.post_ui(update_labels)
 
     def update_status(self, message):
         """Update status message and log it"""
         message = _safe_ui_message(message)
         self.logger.info(message)
-        self.root.after(0, lambda msg=message: self.status_label.config(text=msg))
+        self.post_ui(lambda msg=message: self.status_label.config(text=msg))
 
 
 class LogTextHandler(logging.Handler):
     """Custom log handler that redirects logs to a tk Text widget"""
 
-    def __init__(self, text_widget):
+    def __init__(self, text_widget, post_ui):
         logging.Handler.__init__(self)
         self.text_widget = text_widget
+        self.post_ui = post_ui
 
     def emit(self, record):
         msg = self.format(record)
@@ -2376,8 +2386,7 @@ class LogTextHandler(logging.Handler):
             self.text_widget.see("end")  # Scroll to the bottom
             self.text_widget.config(state="disabled")
 
-        # Schedule the update in the main thread
-        self.text_widget.after(0, append_log)
+        self.post_ui(append_log)
 
 
 def main():

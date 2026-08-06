@@ -41,7 +41,8 @@ the worker. In AI bullet mode it requires a readonly **Review before apply** or 
 selection, persists the stable policy value locally, and repeats it in the run confirmation.
 It also retains a tested Dice session in memory for the current process, validates reuse on a
 protected profile route, and exposes secret-free structured progress in Current job, Current
-step, Resume, and Last result fields.
+step, Resume, and Last result fields. Worker updates are passed through a thread-safe queue and
+executed only by Tk's main loop; browser, logging, and review workers never call Tk directly.
 
 `core/main_script.py` is the external Dice adapter. It extracts the detail-page description,
 builds a bounded round-robin pool across search queries, requests side-effect-free resume

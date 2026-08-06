@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import queue
+
 from app_tkinter import DiceAutoBotApp, _discovered_prior_applications
 
 
@@ -39,6 +41,7 @@ def test_prior_application_count_uses_only_jobs_discovered_in_this_run() -> None
 def test_stop_summary_does_not_replace_discovered_job_count() -> None:
     app = DiceAutoBotApp.__new__(DiceAutoBotApp)
     app.root = _ImmediateRoot()
+    app.post_ui = lambda callback: callback()
     app.logger = _Logger()
     app.status_label = _Label()
     app.current_step_label = _Label()
@@ -63,3 +66,16 @@ def test_stop_summary_does_not_replace_discovered_job_count() -> None:
 
     assert app.jobs_found_label.text == "42"
     assert "Processed 1/3" in app.status_label.text
+
+
+def test_worker_status_update_is_queued_before_touching_tk_widgets() -> None:
+    app = DiceAutoBotApp.__new__(DiceAutoBotApp)
+    app._ui_callbacks = queue.SimpleQueue()
+    app.logger = _Logger()
+    app.status_label = _Label()
+
+    app.update_status("Worker update")
+
+    assert app.status_label.text == ""
+    app._ui_callbacks.get_nowait()()
+    assert app.status_label.text == "Worker update"
