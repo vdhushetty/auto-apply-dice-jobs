@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from app_tkinter import DiceAutoBotApp, _credential_fingerprint
+from core.main_script import ApplicationStatus, RunMode
 
 
 class DummyEntry:
@@ -17,6 +20,14 @@ class DummyWidget:
 
     def config(self, **options: object) -> None:
         self.options.update(options)
+
+
+class DummyLogger:
+    def __init__(self) -> None:
+        self.errors: list[str] = []
+
+    def error(self, message: str) -> None:
+        self.errors.append(message)
 
 
 class AliveThread:
@@ -116,3 +127,54 @@ def test_login_state_never_keeps_non_dice_cookies() -> None:
 
     assert app.login_session_cookies == ()
     assert "credentials verified" in str(app.login_status_label.options["text"]).lower()
+
+
+def test_submit_start_delegates_to_role_ordered_runner() -> None:
+    app = DiceAutoBotApp.__new__(DiceAutoBotApp)
+    received = []
+    app._run_role_ordered_submission = lambda limit, mode, policy: received.append(
+        (limit, mode, policy)
+    )
+    app.selected_ai_review_policy = lambda: "skip_review"
+    service = SimpleNamespace(mode=SimpleNamespace(value="ai_bullets"))
+
+    app.run_job_application([], [], [], "", "", service, False, 10, RunMode.SUBMIT, "", ())
+
+    assert received == [(10, "ai_bullets", "skip_review")]
+
+
+def test_role_ordered_runner_surfaces_confirmed_submission(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    app = DiceAutoBotApp.__new__(DiceAutoBotApp)
+    statuses: list[str] = []
+    notices = []
+    app.running = True
+    app.logger = DummyLogger()
+    app.jobs_applied_label = DummyWidget()
+    app.jobs_skipped_label = DummyWidget()
+    app.jobs_failed_label = DummyWidget()
+    app.update_status = statuses.append
+    app.post_ui = lambda callback: callback()
+    app.reset_ui = lambda: statuses.append("reset")
+    monkeypatch.setattr(
+        "app_tkinter.run_role_ordered",
+        lambda limit, **kwargs: (
+            kwargs["event_callback"](
+                {
+                    "status": ApplicationStatus.APPLIED.value,
+                    "job_title": "Data Engineer",
+                }
+            )
+            or 1
+        ),
+    )
+    monkeypatch.setattr(
+        "app_tkinter.messagebox.showinfo",
+        lambda title, message: notices.append((title, message)),
+    )
+
+    app._run_role_ordered_submission(10, "ai_bullets", "skip_review")
+
+    assert app.jobs_applied_label.options["text"] == "1"
+    assert any("Dice confirmed 1 new application" in value for value in statuses)
+    assert notices and notices[0][0] == "Process Complete"
+    assert statuses[-1] == "reset"
