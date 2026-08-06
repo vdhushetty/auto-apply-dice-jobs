@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from core.main_script import ApplicationStatus
-from scripts.run_role_ordered import _append_ledger, _recorded_applied_urls
+from scripts.run_role_ordered import _append_ledger, _browser_session_lost, _recorded_applied_urls
 
 
 def test_ledger_recovers_only_dice_confirmed_submission_urls(tmp_path: Path) -> None:
@@ -23,3 +23,9 @@ def test_ledger_recovers_only_dice_confirmed_submission_urls(tmp_path: Path) -> 
 
     assert _recorded_applied_urls(ledger) == {"https://dice.com/a", "https://dice.com/existing"}
     assert json.loads(ledger.read_text(encoding="utf-8").splitlines()[0])["status"] == "applied"
+
+
+def test_browser_session_recovery_is_limited_to_closed_browser_failures() -> None:
+    assert _browser_session_lost("Application flow failed: NoSuchWindowException.")
+    assert _browser_session_lost("target window already closed from unknown error")
+    assert not _browser_session_lost("Dice did not confirm the application.")

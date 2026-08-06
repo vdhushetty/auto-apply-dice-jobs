@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -81,6 +82,31 @@ def _outcome_entry(query: str, job: Mapping[str, Any], result) -> dict[str, Any]
     }
 
 
+def _browser_session_lost(reason: object) -> bool:
+    """Identify browser-process loss without treating ordinary application failures as recoverable."""
+
+    message = str(reason or "").casefold()
+    return any(
+        marker in message
+        for marker in (
+            "nosuchwindowexception",
+            "invalidsessionidexception",
+            "target window already closed",
+            "web view not found",
+        )
+    )
+
+
+def _authenticated_driver(username: str, password: str):
+    driver = get_web_driver(headless=False)
+    authenticated, _ = authenticate_dice_session(driver, (username, password))
+    if not authenticated:
+        with suppress(Exception):
+            driver.quit()
+        raise RuntimeError("Dice authentication was not confirmed.")
+    return driver
+
+
 def run(
     limit: int,
     *,
@@ -117,11 +143,8 @@ def run(
     known_applied = _recorded_applied_urls(ledger_path)
     seen_urls = set(known_applied)
     submitted = 0
-    driver = get_web_driver(headless=False)
+    driver = _authenticated_driver(username, password)
     try:
-        authenticated, _ = authenticate_dice_session(driver, (username, password))
-        if not authenticated:
-            raise RuntimeError("Dice authentication was not confirmed.")
         for query in queries:
             if cancel_requested is not None and cancel_requested():
                 break
@@ -141,11 +164,24 @@ def run(
                     seen_urls.add(url)
                     job["Search Query"] = query
                     fresh_jobs.append(job)
-            for job in fresh_jobs:
+            for position, job in enumerate(fresh_jobs, start=1):
                 if cancel_requested is not None and cancel_requested():
                     break
                 if role_submitted >= limit:
                     break
+
+                if event_callback is not None:
+                    event_callback(
+                        {
+                            "kind": "progress",
+                            "stage": "starting_search_result",
+                            "job_title": str(job.get("Job Title", "")),
+                            "reason": (
+                                f"Data from search result {position}/{len(fresh_jobs)}: "
+                                "opening this job before moving to the next result."
+                            ),
+                        }
+                    )
 
                 def progress(event):
                     if event_callback is not None:
@@ -174,6 +210,22 @@ def run(
                 if result.status is ApplicationStatus.APPLIED:
                     submitted += 1
                     role_submitted += 1
+                if _browser_session_lost(result.reason):
+                    if event_callback is not None:
+                        event_callback(
+                            {
+                                "kind": "progress",
+                                "stage": "recovering_browser",
+                                "job_title": str(job.get("Job Title", "")),
+                                "reason": (
+                                    "Dice's browser session closed. Restarting it and continuing "
+                                    "with the next search result."
+                                ),
+                            }
+                        )
+                    with suppress(Exception):
+                        driver.quit()
+                    driver = _authenticated_driver(username, password)
     finally:
         driver.quit()
     print(json.dumps({"submitted": submitted, "per_role_cap": limit}), flush=True)
