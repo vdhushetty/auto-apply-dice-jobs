@@ -545,6 +545,7 @@ _NON_RESUME_INPUT_TERM = re.compile(
     r"\b(?:avatar|cover\s*letter|photo|portfolio|profile\s*(?:image|picture))\b",
     re.IGNORECASE,
 )
+_GENERIC_DICE_DOCUMENT_EXTENSIONS = frozenset({"pdf", "doc", "docx", "rtf"})
 
 
 def _file_input_descriptor(driver, file_input) -> str:
@@ -596,6 +597,17 @@ def _file_input_signature(file_input, position: int) -> str:
     return f"input-{position}({'; '.join(attributes)})"
 
 
+def _is_generic_dice_document_input(file_input) -> bool:
+    """Recognize Dice's unlabeled, single document picker without accepting arbitrary files."""
+
+    try:
+        accepted = str(file_input.get_attribute("accept") or "").casefold()
+    except Exception:
+        return False
+    extensions = frozenset(re.findall(r"[a-z0-9]+", accepted))
+    return _GENERIC_DICE_DOCUMENT_EXTENSIONS.issubset(extensions)
+
+
 def _upload_resume_if_present(
     driver,
     resume_path: str,
@@ -606,10 +618,19 @@ def _upload_resume_if_present(
     inputs = driver.find_elements(By.CSS_SELECTOR, 'input[type="file"]')
     if not inputs:
         return False, False, "Dice did not expose a file input on the current Easy Apply step."
+    input_descriptors: list[tuple[Any, str]] = []
     resume_inputs = []
     for file_input in inputs:
         descriptor = _file_input_descriptor(driver, file_input)
+        input_descriptors.append((file_input, descriptor))
         if _RESUME_INPUT_TERM.search(descriptor) and not _NON_RESUME_INPUT_TERM.search(descriptor):
+            resume_inputs.append(file_input)
+    if not resume_inputs and len(inputs) == 1:
+        file_input, descriptor = input_descriptors[0]
+        if (
+            not _NON_RESUME_INPUT_TERM.search(descriptor)
+            and _is_generic_dice_document_input(file_input)
+        ):
             resume_inputs.append(file_input)
     if not resume_inputs:
         signatures = ", ".join(

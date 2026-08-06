@@ -88,9 +88,15 @@ bypasses only human inspection. Verify Upload also warns that Dice may retain dr
 Before Submit, the browser must verify the chosen/generated filename from the scoped file input's
 `files[0].name` or exact input value. Global page text is not upload evidence. A click is never
 considered success; Dice must display a visible, scoped confirmation element.
+
+Dice occasionally renders an unlabeled file input in the initial Easy Apply wizard. The browser
+accepts it as the resume field only when it is the sole file input, its surrounding context does
+not indicate a cover letter or other non-resume document, and its `accept` contract includes PDF,
+DOC, DOCX, and RTF. The exact selected filename is still required before advancing or submitting.
 The requested job-detail path, canonical structured-data URL, post-navigation path, and Easy Apply
-job identifier must agree. File selection requires exactly one resume/CV-labelled input; ambiguous
-or unrelated attachment fields fail closed.
+job identifier must agree. File selection requires exactly one resume/CV-labelled input or the
+narrowed Dice document-picker contract above; ambiguous or unrelated attachment fields fail
+closed.
 
 The UI progress channel is observational only: callback failures cannot change browser behavior.
 Messages are length-bounded and redact secret-like tokens and local paths. It distinguishes the
