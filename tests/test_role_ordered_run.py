@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from core.main_script import ApplicationStatus
+import scripts.run_role_ordered as role_ordered
+from core.main_script import ApplicationResult, ApplicationStatus
 from scripts.run_role_ordered import _append_ledger, _browser_session_lost, _recorded_applied_urls
 
 
@@ -29,3 +30,76 @@ def test_browser_session_recovery_is_limited_to_closed_browser_failures() -> Non
     assert _browser_session_lost("Application flow failed: NoSuchWindowException.")
     assert _browser_session_lost("target window already closed from unknown error")
     assert not _browser_session_lost("Dice did not confirm the application.")
+
+
+def test_role_run_restarts_browser_and_continues_with_next_result(
+    monkeypatch, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    class Driver:
+        def __init__(self) -> None:
+            self.quit_called = False
+
+        def quit(self) -> None:
+            self.quit_called = True
+
+    created_drivers = [Driver(), Driver()]
+    drivers = list(created_drivers)
+    applied_urls: list[str] = []
+    events: list[dict[str, str]] = []
+
+    monkeypatch.setenv("DICE_USERNAME", "candidate@example.com")
+    monkeypatch.setenv("DICE_PASSWORD", "not-a-real-password")
+    monkeypatch.setattr(role_ordered, "load_dotenv", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        role_ordered,
+        "_load_settings",
+        lambda: {
+            "search_queries": ["Data Engineer"],
+            "include_keywords": [],
+            "exclude_keywords": [],
+        },
+    )
+    monkeypatch.setattr(
+        role_ordered.ResumeService,
+        "from_settings",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(role_ordered, "get_web_driver", lambda **kwargs: drivers.pop(0))
+    monkeypatch.setattr(role_ordered, "authenticate_dice_session", lambda *args: (True, ""))
+    monkeypatch.setattr(
+        role_ordered,
+        "fetch_jobs_with_requests",
+        lambda *args, **kwargs: (
+            [
+                {"Job Title": "First", "Job URL": "https://www.dice.com/job-detail/first"},
+                {"Job Title": "Second", "Job URL": "https://www.dice.com/job-detail/second"},
+            ],
+            [],
+        ),
+    )
+
+    def apply(_driver, job, _service, **_kwargs):
+        applied_urls.append(job["Job URL"])
+        if len(applied_urls) == 1:
+            return ApplicationResult(
+                ApplicationStatus.FAILED,
+                "Application flow failed: NoSuchWindowException.",
+            )
+        return ApplicationResult(ApplicationStatus.APPLIED, "Dice confirmed submission.")
+
+    monkeypatch.setattr(role_ordered, "apply_to_job_url", apply)
+
+    submitted = role_ordered.run(
+        1,
+        skip_review=True,
+        ledger_path=tmp_path / "ledger.jsonl",
+        event_callback=events.append,
+    )
+
+    assert submitted == 1
+    assert applied_urls == [
+        "https://www.dice.com/job-detail/first",
+        "https://www.dice.com/job-detail/second",
+    ]
+    assert all(driver.quit_called for driver in created_drivers)
+    assert any(event.get("stage") == "recovering_browser" for event in events)
