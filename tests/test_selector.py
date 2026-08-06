@@ -367,6 +367,59 @@ def test_single_resume_selector_fails_closed_on_missing_required_term() -> None:
     assert not decision.ambiguous
 
 
+def test_single_resume_selector_can_tailor_despite_initial_match_gaps() -> None:
+    custom = ResumeVariant(
+        profile=CustomProfile.CUSTOM,
+        path=Path("/base.docx"),
+        text="Data engineer Python SQL",
+        terms=extract_technology_terms("Data engineer Python SQL"),
+        lexical_tokens=extract_lexical_tokens("Data engineer Python SQL"),
+    )
+
+    decision = SingleResumeSelector(
+        custom,
+        threshold=90,
+        allow_tailoring_below_match_threshold=True,
+    ).select(
+        JobPosting(
+            title="GCP Data Engineer",
+            description="Requirements:\n- GCP\n- BigQuery\n- Python\n- SQL",
+            url="https://www.dice.com/job-detail/custom-tailor-anyway",
+        )
+    )
+
+    assert decision.eligible
+    assert decision.tailoring_match_gate_bypassed
+    assert {"gcp", "gcp-bigquery"} <= set(decision.missing_required_terms)
+    assert "will be tailored from the full job description" in decision.reason
+
+
+def test_single_resume_tailoring_override_keeps_employment_constraints_blocked() -> None:
+    custom = ResumeVariant(
+        profile=CustomProfile.CUSTOM,
+        path=Path("/base.docx"),
+        text="Data engineer Python SQL",
+        terms=extract_technology_terms("Data engineer Python SQL"),
+        lexical_tokens=extract_lexical_tokens("Data engineer Python SQL"),
+    )
+
+    decision = SingleResumeSelector(
+        custom,
+        threshold=0,
+        allow_tailoring_below_match_threshold=True,
+    ).select(
+        JobPosting(
+            title="Data Engineer",
+            description="US citizenship is required for this cleared role.",
+            url="https://www.dice.com/job-detail/custom-tailor-restricted",
+        )
+    )
+
+    assert not decision.eligible
+    assert "citizenship or sponsorship restriction" in decision.manual_review_reasons
+    assert not decision.tailoring_match_gate_bypassed
+
+
 @pytest.mark.parametrize("margin", [-1, 101])
 def test_rejects_invalid_minimum_winner_margin(
     variants: tuple[ResumeVariant, ...], margin: float

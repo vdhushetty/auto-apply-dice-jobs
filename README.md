@@ -21,14 +21,15 @@ navigation and retrieval, inaccurate resume content, and keyword stuffing. See t
   every returned ID is an exact permutation of candidate-authored skill items, and create a
   job-specific DOCX. The model cannot add, delete, rename, or rewrite skills or claims. The
   generated file must render to the same page count as its source or it is deleted and skipped.
-- **AI bullet tailoring (`ai_bullets`):** score one user-provided base DOCX against the title and
-  full job description, then ask OpenAI for a bounded, evidence-grounded rewrite of up to four
-  existing experience bullets. At most two net-new bullets may be produced by splitting supported
-  source material. Local validation rejects technologies or quantified claims absent from the
-  cited same-role bullets and locks every non-target paragraph and structural feature. The prompt
-  prohibits invented experience, employers, dates, education, or other candidate facts. The
-  generated DOCX must keep the source page count. Before starting, the user explicitly chooses
-  **Review before apply** or **Skip review**.
+- **AI bullet tailoring (`ai_bullets`):** read the full job description and create a fresh,
+  bounded, evidence-grounded rewrite of up to four existing experience bullets for every
+  Easy Apply job. The initial score is recorded for visibility but does not reject a job. At most
+  two net-new bullets may be produced by splitting supported source material. Local validation
+  rejects technologies or quantified claims absent from the cited same-role bullets and locks
+  every non-target paragraph and structural feature. The prompt prohibits invented experience,
+  employers, dates, education, or other candidate facts. The generated DOCX must keep the source
+  page count. Before starting, the user explicitly chooses **Review before apply** or
+  **Skip review**.
 
 Static and tailored modes require exactly three user-approved files labelled AWS, Azure, and GCP.
 AI bullet tailoring uses one user-approved DOCX. No personal resume files are included in the
@@ -43,7 +44,7 @@ all evidence, structure, page-count, matching, upload-filename, form, and confir
 The application skips instead of submitting when any of these checks fail:
 
 - the job description cannot be read;
-- the best resume score is below the configured threshold;
+- in static or tailored mode, the best resume score is below the configured threshold;
 - tailored output is refused, malformed, unchanged, or structurally unsafe;
 - AI bullet output lacks candidate evidence, changes protected content/layout, or cannot satisfy
   the selected review policy;
@@ -129,9 +130,11 @@ In **Settings**:
 5. In AI bullet mode, explicitly choose **Review before apply** (the safe default) or
    **Skip review**. The selected stable policy is saved in the ignored local settings file.
 6. Choose the minimum match score, winner margin, and 1–15 confirmed applications per role.
-   Submit mode searches and completes Data Engineer results first, then Data Analyst, Machine
-   Learning, AI/ML, GenAI, and Agentic AI. It records confirmed/already-applied jobs locally so
-   later runs skip them and continue with new or previously unapplied search results.
+   In AI bullet mode, the score is recorded but is not a submission gate. Submit mode searches
+   and completes Data Engineer results first, then Data Analyst, Machine Learning, AI/ML, GenAI,
+   and Agentic AI. It completes each result's full description → curated resume → upload →
+   confirmation flow before opening the next result. It records confirmed/already-applied jobs
+   locally so later runs skip them and continue with new or previously unapplied search results.
 7. Save settings. Personal paths are written atomically to ignored
    `config/settings.local.json` with local-only permissions.
 8. Start the bot and read the mode-specific confirmation. It repeats the selected AI review

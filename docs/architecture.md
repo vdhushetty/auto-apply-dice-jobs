@@ -64,8 +64,9 @@ cloud/data/AI terms, combines weighted title/description coverage with a small l
 scores every source resume, and enforces the local threshold.
 It also parses required bullet sections, requires a configurable winner margin, routes explicit
 single-cloud titles, and fails closed on employment restrictions requiring manual review.
-For AI bullet mode, `SingleResumeSelector` applies the same title/full-description threshold,
-required-term, and restriction gates to one custom profile without a three-way winner margin.
+For AI bullet mode, `SingleResumeSelector` records the title/full-description score and missing
+terms, but does not use either as an initial curation gate. It still stops explicit employment
+restrictions for manual review; the bullet validator separately rejects unsupported claims.
 
 `core/resumes/curator.py` is the only OpenAI SDK boundary. It uses the Responses API, Structured
 Outputs, `store=False`, bounded SDK retries/timeouts, fixed low reasoning, and a configurable

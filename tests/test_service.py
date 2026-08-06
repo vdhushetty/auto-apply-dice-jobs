@@ -450,6 +450,34 @@ def test_ai_bullets_uses_one_resume_and_hash_bound_review(tmp_path: Path) -> Non
     assert "sk-test-secret-not-real" not in artifact_text
 
 
+def test_ai_bullets_attempts_curation_despite_low_initial_match(tmp_path: Path) -> None:
+    source = make_ai_resume(tmp_path / "base.docx")
+    planner = AIBulletPlanner()
+    service = ResumeService.from_settings(
+        {
+            "resume_mode": "ai_bullets",
+            "ai_resume_path": str(source),
+            "ai_resume_output_dir": str(tmp_path / "ai-out"),
+            "minimum_match_score": 95,
+            "ai_review_policy": "skip_review",
+        },
+        bullet_planner=planner,
+        layout_verifier=lambda source_path, output_path: None,
+    )
+    job = JobPosting(
+        title="AWS Data Engineer",
+        description="Required: AWS Glue, S3, Python, SQL, and Terraform.",
+        url="https://www.dice.com/job-detail/ai-low-initial-match",
+    )
+
+    result = service.prepare(job)
+
+    assert result.eligible and result.prepared is not None
+    assert result.decision is not None
+    assert result.decision.tailoring_match_gate_bypassed
+    assert planner.calls == 1
+
+
 def test_ai_bullets_retries_one_source_ungrounded_technology_plan(tmp_path: Path) -> None:
     source = make_ai_resume(tmp_path / "base.docx")
     planner = RetryingAIBulletPlanner()

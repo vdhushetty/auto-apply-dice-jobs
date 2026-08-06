@@ -32,9 +32,10 @@ Dice account, every source resume, and every factual claim in them.
   at least one candidate slot per nonempty search bucket, before the application cap is applied.
 - Static mode uploads the highest-scoring original file unchanged.
 - Tailored mode selects a DOCX and reorders only exact items in parseable skills lists.
-- AI bullet mode uses a single-resume deterministic title + full-description score, rewrites only
-  bounded experience bullets supported by the source resume, preserves every protected section
-  and structural feature, and enforces the selected review policy before upload.
+- AI bullet mode records a single-resume title + full-description score but does not use it as an
+  initial rejection gate. It rewrites only bounded experience bullets supported by the source
+  resume, preserves every protected section and structural feature, and enforces the selected
+  review policy before upload.
 - If an AI bullet plan introduces a technology absent from its cited source bullets, the app makes
   one more conservative, source-bound request; a second invalid plan is skipped.
 - In the one-job **Verify Upload** mode only, an AI no-op or explicit no-relevant-change result
@@ -47,7 +48,9 @@ Dice account, every source resume, and every factual claim in them.
 - A valid AI review-policy selection is required before any AI bullet automation starts and is
   repeated in the run confirmation. Verify Upload warns that it may leave one Dice draft after
   its one permitted file-selection attempt.
-- The relevance threshold is applied before any OpenAI call or Apply click.
+- The relevance threshold is applied before any OpenAI call or Apply click in static and tailored
+  modes. AI bullet tailoring instead attempts a full-description curation and relies on source
+  evidence, document, upload, and submission checks.
 - Close winners, explicit clearance/citizenship/sponsorship/W2/onsite restrictions, missing
   required technologies, and visible screening questions require manual review or a skip.
 - Tailored output must retain source page count after LibreOffice rendering.

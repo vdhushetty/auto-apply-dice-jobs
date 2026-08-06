@@ -482,13 +482,20 @@ class ResumeSelector:
 class SingleResumeSelector:
     """Evaluate one user-provided resume against the title and full job description."""
 
-    def __init__(self, variant: ResumeVariant, threshold: float) -> None:
+    def __init__(
+        self,
+        variant: ResumeVariant,
+        threshold: float,
+        *,
+        allow_tailoring_below_match_threshold: bool = False,
+    ) -> None:
         if variant.profile is not CustomProfile.CUSTOM:
             raise ValueError("The single-resume selector requires the custom resume profile.")
         if not 0.0 <= threshold <= 100.0:
             raise ValueError("The relevance threshold must be between 0 and 100.")
         self._variant = variant
         self._threshold = float(threshold)
+        self._allow_tailoring_below_match_threshold = allow_tailoring_below_match_threshold
 
     def select(self, job: JobPosting) -> MatchDecision:
         title_terms = extract_technology_terms(job.title)
@@ -511,13 +518,22 @@ class SingleResumeSelector:
             score=score,
             threshold=self._threshold,
             eligible=(
-                score >= self._threshold and not missing_required and not manual_review_reasons
+                not manual_review_reasons
+                and (
+                    self._allow_tailoring_below_match_threshold
+                    or (score >= self._threshold and not missing_required)
+                )
             ),
             matched_terms=matched,
             missing_terms=missing,
             missing_required_terms=missing_required,
             variant_scores={CustomProfile.CUSTOM.value: score},
             manual_review_reasons=manual_review_reasons,
+            tailoring_match_gate_bypassed=(
+                self._allow_tailoring_below_match_threshold
+                and (score < self._threshold or bool(missing_required))
+                and not manual_review_reasons
+            ),
         )
 
 

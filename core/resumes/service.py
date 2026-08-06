@@ -142,6 +142,11 @@ class ResumeService:
             self._selector = SingleResumeSelector(
                 custom_variant,
                 threshold,
+                # AI curation reads the full description and makes a fresh resume.  An
+                # initial lexical/technology score is useful telemetry, not an apply gate.
+                # The rewrite validator still rejects unsupported claims and the selector
+                # still stops explicit employment constraints for human review.
+                allow_tailoring_below_match_threshold=True,
             )
             self._bullet_planner = bullet_planner
             if bullet_planner is not None:

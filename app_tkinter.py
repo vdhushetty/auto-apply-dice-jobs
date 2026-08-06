@@ -926,7 +926,11 @@ class DiceAutoBotApp:
             width=6,
             textvariable=self.minimum_match_score_var,
         ).pack(side="left")
-        ttk.Label(self.threshold_row, text="% (lower matches are skipped)").pack(
+        self.threshold_help_label = ttk.Label(
+            self.threshold_row,
+            text="% (lower matches are skipped)",
+        )
+        self.threshold_help_label.pack(
             side="left", padx=5
         )
 
@@ -995,7 +999,8 @@ Understanding Keywords
 
 Include Keywords: Jobs must contain at least one of these words in the title
 Exclude Keywords: Jobs containing any of these words will be skipped
-Resume Match: Jobs below the configured title + description score are skipped
+Resume Match: Static and tailored modes skip jobs below the configured score. AI bullet
+tailoring records the initial score but curates from the full job description instead.
 
 Finding Results
 -------------
@@ -1063,6 +1068,9 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             self.ai_resume_path_row.pack(fill="x", padx=5, pady=3)
             self.ai_options_frame.pack(fill="x", after=self.resume_paths_frame)
             self.margin_row.pack_forget()
+            self.threshold_help_label.config(
+                text="% (recorded for visibility; AI tailoring does not skip low matches)"
+            )
             self.validate_resumes_button.config(text="Validate Base Resume")
             self.resume_mode_help_label.config(
                 text=(
@@ -1078,6 +1086,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
 
         for row in self.resume_path_rows.values():
             row.pack(fill="x", padx=5, pady=3)
+        self.threshold_help_label.config(text="% (lower matches are skipped)")
         self.margin_row.pack(fill="x", padx=5, pady=4, after=self.threshold_row)
         self.validate_resumes_button.config(text="Validate Three Resumes")
         if mode == "tailored":

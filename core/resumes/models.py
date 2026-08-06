@@ -138,6 +138,7 @@ class MatchDecision:
     minimum_winner_margin: float = 0.0
     explicit_title_profile: CloudProfile | None = None
     manual_review_reasons: tuple[str, ...] = ()
+    tailoring_match_gate_bypassed: bool = False
 
     @property
     def reason(self) -> str:
@@ -152,10 +153,21 @@ class MatchDecision:
                 "confident unique best match."
             )
         if self.missing_required_terms:
+            if self.eligible and self.tailoring_match_gate_bypassed:
+                return (
+                    "Custom base resume will be tailored from the full job description "
+                    f"despite an initial {self.score:.1f}% match; unsupported terms will not "
+                    "be added."
+                )
             terms = ", ".join(self.missing_required_terms)
             return f"Selected resume is missing required job terms: {terms}."
         if self.eligible:
             if self.selected_profile is CustomProfile.CUSTOM:
+                if self.tailoring_match_gate_bypassed:
+                    return (
+                        "Custom base resume will be tailored from the full job description "
+                        f"despite an initial {self.score:.1f}% match."
+                    )
                 return f"Custom base resume matched at {self.score:.1f}%."
             return f"Selected {self.selected_profile.value.upper()} at {self.score:.1f}% match."
         selection_label = "Selected resume" if self.explicit_title_profile else "Best resume"
