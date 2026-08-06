@@ -159,7 +159,8 @@ def test_account_control_confirms_loaded_profile_page() -> None:
     )
 
 
-def test_restore_session_transfers_only_dice_domain_cookies() -> None:
+def test_restore_session_transfers_only_dice_domain_cookies(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("DICE_AUTOMATION_AUTHORIZED", "true")
     driver = AuthenticatedSessionDriver()
 
     assert restore_dice_session(
