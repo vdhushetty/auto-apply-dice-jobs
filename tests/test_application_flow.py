@@ -251,6 +251,38 @@ class ResumeReplacementWizardDriver(WizardDriver):
         return super().execute_script(script, *args)
 
 
+class TwoPickerResumeReplacementDriver(ResumeReplacementWizardDriver):
+    """Models Dice retaining Cover letter's input alongside the new Resume picker."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        assert self.file_input is not None
+        self.cover_letter_input = self.file_input
+        self.cover_letter_input.id = "cover-letter-picker"
+        self.resume_replacement_input = FakeElement(
+            attributes={"accept": ".pdf,.doc,.docx,.rtf,.txt"}
+        )
+        self.resume_replacement_input.id = "resume-replacement-picker"
+        self.replaced = False
+
+    def _replace_resume(self) -> None:
+        self.replaced = True
+
+    def find_elements(self, by: str, selector: str) -> list[FakeElement]:
+        if selector == 'input[type="file"]':
+            if self.replaced:
+                return [self.resume_replacement_input, self.cover_letter_input]
+            return [self.cover_letter_input]
+        return super().find_elements(by, selector)
+
+    def execute_script(self, script: str, *args: Any) -> Any:
+        if "const el = arguments[0]" in script:
+            return "Resume & Cover Letter Resume Upload your resume Cover letter Optional"
+        if "files = arguments[0].files" in script and args:
+            return args[0].selected_file_name
+        return super().execute_script(script, *args)
+
+
 class ImmediateWait:
     def __init__(self, driver: FakeDriver, *args: Any, **kwargs: Any) -> None:
         self.driver = driver
@@ -1018,6 +1050,33 @@ def test_dice_resume_replacement_uses_resume_file_options_not_cover_letter(
     assert not driver.cover_letter_file_options.clicked
     assert driver.replace_option.clicked
     assert driver.file_input is not None and driver.file_input.send_keys_calls == 1
+    assert not driver.next_button.clicked
+    assert not driver.submit_button.clicked
+
+
+def test_dice_resume_replacement_selects_new_picker_when_cover_picker_remains(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    resume = tmp_path / "tailored-azure.docx"
+    resume.touch()
+    driver = TwoPickerResumeReplacementDriver()
+    monkeypatch.setattr(main_script, "_extract_job_description", lambda current: "Azure " * 50)
+    monkeypatch.setattr(main_script, "WebDriverWait", ImmediateWait)
+
+    result = apply_to_job_url(
+        driver,
+        {
+            "Job Title": "Azure Engineer",
+            "Job URL": "https://www.dice.com/job-detail/two-pickers",
+        },
+        PreparedService(resume),  # type: ignore[arg-type]
+        run_mode=RunMode.VERIFY_UPLOAD,
+    )
+
+    assert result.status is ApplicationStatus.UPLOAD_VERIFIED
+    assert driver.resume_replacement_input.send_keys_calls == 1
+    assert driver.cover_letter_input.send_keys_calls == 0
     assert not driver.next_button.clicked
     assert not driver.submit_button.clicked
 

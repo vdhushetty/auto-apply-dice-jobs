@@ -607,6 +607,13 @@ def _is_generic_dice_document_input(file_input) -> bool:
     return _GENERIC_DICE_DOCUMENT_EXTENSIONS.issubset(extensions)
 
 
+def _element_identity(element: Any) -> str:
+    """Return Selenium's stable element id when available, without page inspection."""
+
+    value = getattr(element, "id", None)
+    return str(value or "")
+
+
 def _open_dice_resume_replace_picker(driver) -> tuple[bool, str]:
     """Open Dice's Resume-only replacement picker, never the cover-letter one.
 
@@ -688,6 +695,7 @@ def _upload_resume_if_present(
     selection_callback: Callable[[], None] | None = None,
 ) -> tuple[bool, bool, str]:
     inputs = driver.find_elements(By.CSS_SELECTOR, 'input[type="file"]')
+    original_input_ids = {_element_identity(file_input) for file_input in inputs}
     input_descriptors: list[tuple[Any, str]] = []
     resume_inputs = []
     for file_input in inputs:
@@ -719,12 +727,20 @@ def _upload_resume_if_present(
             # combined Resume & Cover Letter form, so its ancestor text includes
             # "Cover letter" even though the only input was created for Resume.
             # Its narrow document contract is safe only after that exact action.
+            replacement_inputs = [
+                file_input
+                for file_input in inputs
+                if _element_identity(file_input)
+                and _element_identity(file_input) not in original_input_ids
+            ]
+            if not replacement_inputs and len(inputs) == 1:
+                replacement_inputs = inputs
             if (
                 not resume_inputs
-                and len(inputs) == 1
-                and _is_generic_dice_document_input(inputs[0])
+                and len(replacement_inputs) == 1
+                and _is_generic_dice_document_input(replacement_inputs[0])
             ):
-                resume_inputs.append(inputs[0])
+                resume_inputs.append(replacement_inputs[0])
         elif not inputs:
             return False, False, replacement_reason
     if not resume_inputs:
@@ -1325,6 +1341,34 @@ def apply_to_job_url(
             result = ApplicationResult(
                 ApplicationStatus.SKIPPED,
                 "Run cancelled before opening Dice Easy Apply.",
+                resume_profile=profile,
+                match_score=score,
+            )
+            return result
+        # Resume generation can take long enough for Dice's React page to replace
+        # the original Apply element. Reacquire it immediately before interaction
+        # instead of attempting to scroll/click a stale element reference.
+        apply_control = _find_apply_control(driver, job_url)
+        if apply_control is None:
+            result = ApplicationResult(
+                ApplicationStatus.SKIPPED,
+                "Dice Easy Apply was no longer available after resume preparation.",
+                resume_profile=profile,
+                match_score=score,
+            )
+            return result
+        if "applied" in (apply_control.text or "").strip().lower():
+            result = ApplicationResult(
+                ApplicationStatus.ALREADY_APPLIED,
+                "Dice indicates this job has already been applied to.",
+                resume_profile=profile,
+                match_score=score,
+            )
+            return result
+        if not apply_control.is_enabled():
+            result = ApplicationResult(
+                ApplicationStatus.SKIPPED,
+                "Dice Easy Apply is no longer enabled after resume preparation.",
                 resume_profile=profile,
                 match_score=score,
             )
