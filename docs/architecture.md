@@ -117,5 +117,7 @@ file.
 ## Failure model
 
 Expected uncertainty is a skip, not an exception-driven fallback. Configuration errors block the
-run. Provider/document errors skip that job. Browser errors are failures. Already-applied jobs
-are tracked separately and never counted as new submissions.
+run. Provider/document errors skip that job. The narrow exception is Verify Upload's explicit,
+no-submit source-resume fallback after AI finds no safe non-identical bullet change; it is marked
+in structured progress and is unavailable to Submit. Browser errors are failures. Already-applied
+jobs are tracked separately and never counted as new submissions.

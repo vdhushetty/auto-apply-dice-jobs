@@ -115,6 +115,26 @@ class RetryingAIBulletPlanner(AIBulletPlanner):
         return super().plan(job, bullets)
 
 
+class NoOpAIBulletPlanner:
+    model = "fake-ai-model"
+
+    def plan(self, job: JobPosting, bullets: Sequence[EditableBullet]) -> dict[str, Any]:
+        target = bullets[0]
+        return {
+            "schema_version": "1",
+            "outcome": "rewrite",
+            "reason_code": "ok",
+            "job_evidence": [{"quote": "AWS", "priority": "required"}],
+            "edits": [
+                {
+                    "bullet_id": target.bullet_id,
+                    "replacement_bullets": [target.text],
+                    "source_bullet_ids": [target.bullet_id],
+                }
+            ],
+        }
+
+
 class ExplodingAIBulletPlanner:
     model = "fake-ai-model"
 
@@ -456,6 +476,46 @@ def test_ai_bullets_retries_one_source_ungrounded_technology_plan(tmp_path: Path
     assert planner.calls == 2
     assert planner.retry_calls == 1
     assert source.exists()
+
+
+def test_ai_bullets_verify_upload_can_use_source_after_noop_plan(tmp_path: Path) -> None:
+    source = make_ai_resume(tmp_path / "base.docx")
+    service = ResumeService.from_settings(
+        {
+            "resume_mode": "ai_bullets",
+            "ai_review_policy": "skip_review",
+            "ai_resume_path": str(source),
+            "ai_resume_output_dir": str(tmp_path / "ai-out"),
+            "minimum_match_score": 20,
+        },
+        bullet_planner=NoOpAIBulletPlanner(),
+        layout_verifier=lambda source_path, output_path: None,
+    )
+    job = JobPosting(
+        title="AWS Data Engineer",
+        description="Required: AWS, Python, and SQL data pipeline experience.",
+        url="https://www.dice.com/job-detail/ai-verify-noop",
+    )
+    evaluation = service.evaluate(job)
+    assert evaluation.eligible and evaluation.decision is not None
+
+    submission_preparation = service.prepare_selected(job, evaluation.decision)
+    assert not submission_preparation.eligible
+    assert submission_preparation.reason == "Bullet rewrite edit is a no-op."
+
+    verification_preparation = service.prepare_selected_for_verification(
+        job,
+        evaluation.decision,
+    )
+
+    assert verification_preparation.eligible and verification_preparation.prepared is not None
+    assert verification_preparation.prepared.path == source
+    assert not verification_preparation.prepared.tailored
+    assert verification_preparation.prepared.verification_fallback
+    assert (
+        service.assert_prepared_resume_ready(job, verification_preparation.prepared)
+        == hashlib.sha256(source.read_bytes()).hexdigest()
+    )
 
 
 def test_ai_bullets_review_rejection_skips_upload_candidate(tmp_path: Path) -> None:

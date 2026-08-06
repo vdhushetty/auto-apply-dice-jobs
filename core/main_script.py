@@ -1106,7 +1106,15 @@ def apply_to_job_url(
             resume_profile=profile,
         )
         if preparation is None:
-            prepare_selected = getattr(resume_service, "prepare_selected", None)
+            prepare_selected = getattr(
+                resume_service,
+                (
+                    "prepare_selected_for_verification"
+                    if mode is RunMode.VERIFY_UPLOAD
+                    else "prepare_selected"
+                ),
+                None,
+            )
             if callable(prepare_selected) and evaluation is not None:
                 decision = getattr(evaluation, "decision", evaluation)
                 preparation = prepare_selected(posting, decision)
@@ -1125,9 +1133,15 @@ def apply_to_job_url(
             )
             return result
         prepared_path = preparation.prepared.path.resolve()
-        resume_kind = "generated" if preparation.prepared.tailored else "selected"
+        if preparation.prepared.verification_fallback:
+            resume_kind = "verify-only fallback"
+        else:
+            resume_kind = "generated" if preparation.prepared.tailored else "selected"
         if isinstance(job, dict):
             job["Tailored Resume"] = bool(preparation.prepared.tailored)
+            job["Verification Resume Fallback"] = bool(
+                preparation.prepared.verification_fallback
+            )
         _emit_application_progress(
             progress_callback,
             ApplicationProgressStage.RESUME_READY,

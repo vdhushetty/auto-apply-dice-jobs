@@ -265,7 +265,8 @@ class OpenAIBulletRewritePlanner:
                 " A previous proposal was rejected by the local evidence validator. Produce a "
                 "new independent plan with especially conservative wording. If a cited source "
                 "does not explicitly name a technology, omit that technology rather than "
-                "inferring it."
+                "inferring it. Do not repeat a target bullet unchanged; return no_safe_plan "
+                "if no truthful non-identical rewrite is available."
             )
         try:
             response = self._client.responses.create(

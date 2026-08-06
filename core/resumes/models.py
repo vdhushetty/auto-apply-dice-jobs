@@ -172,6 +172,10 @@ class PreparedResume:
     path: Path
     decision: MatchDecision
     tailored: bool
+    # This is deliberately limited to the one-job, no-submit upload check.  It lets the
+    # browser prove Dice accepts the user's approved source DOCX when AI correctly finds
+    # no truthful non-identical bullet edit.  It must never be used for a submission run.
+    verification_fallback: bool = False
 
 
 @dataclass(frozen=True)

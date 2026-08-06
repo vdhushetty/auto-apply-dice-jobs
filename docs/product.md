@@ -37,6 +37,10 @@ Dice account, every source resume, and every factual claim in them.
   and structural feature, and enforces the selected review policy before upload.
 - If an AI bullet plan introduces a technology absent from its cited source bullets, the app makes
   one more conservative, source-bound request; a second invalid plan is skipped.
+- In the one-job **Verify Upload** mode only, an AI no-op or explicit no-relevant-change result
+  may use the same user-approved base DOCX to test Dice's filename selection. The Live Automation
+  panel labels this **verify-only fallback**, and the run still never clicks Next or Submit.
+  Submit mode never uses this fallback: it requires a validated, job-specific AI output.
 - `review_before_apply` is the default and requires approval of the exact generated hash before
   upload. `skip_review` bypasses only that human-inspection prompt; all deterministic generation,
   evidence, structure, layout, relevance, upload, form, and confirmation checks remain active.

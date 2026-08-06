@@ -65,7 +65,9 @@ Three side-effect levels are available:
   eligible jobs up to the configured limit, and never click Apply.
 - **Verify upload:** open only the single highest-ranked eligible job and make at most one resume
   file-selection attempt. Stop whether filename verification succeeds or fails; Next and Submit
-  are never clicked. Dice may retain that one draft.
+  are never clicked. Dice may retain that one draft. In AI bullet mode only, a no-op or explicit
+  no-relevant-change plan is visibly labelled **verify-only fallback** and tests this upload using
+  the approved base DOCX; Submit mode still requires a validated tailored output.
 - **Submit:** upload and submit only after all fit, upload, form, and confirmation checks pass.
 
 The **Live Automation** panel distinguishes candidate preflight ("no upload yet") from the actual

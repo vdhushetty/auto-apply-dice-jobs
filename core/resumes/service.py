@@ -68,8 +68,18 @@ from .selector import (
 DEFAULT_THRESHOLD = 35.0
 DEFAULT_OUTPUT_DIR = Path(".data/tailored_resumes")
 DEFAULT_AI_OUTPUT_DIR = Path(".data/ai_resumes")
-_RETRYABLE_AI_BULLET_VALIDATION_ERROR = (
-    "Bullet rewrite introduced a technology absent from its cited source bullets."
+_RETRYABLE_AI_BULLET_VALIDATION_ERRORS = frozenset(
+    {
+        "Bullet rewrite introduced a technology absent from its cited source bullets.",
+        "Bullet rewrite edit is a no-op.",
+    }
+)
+_VERIFY_ONLY_AI_FALLBACK_REASONS = frozenset(
+    {
+        "Bullet rewrite edit is a no-op.",
+        "No safe bullet rewrite plan: insufficient_source_evidence.",
+        "No safe bullet rewrite plan: no_relevant_change.",
+    }
 )
 LayoutVerifier = Callable[[Path, Path], None]
 ReviewCallback = Callable[[JobPosting, Path, str], bool]
@@ -320,6 +330,41 @@ class ResumeService:
             return evaluation
         return self.prepare_selected(job, evaluation.decision)
 
+    def prepare_selected_for_verification(
+        self,
+        job: JobPosting,
+        decision: MatchDecision,
+    ) -> ResumePreparation:
+        """Prepare one resume for the no-submit Dice upload check.
+
+        A verification run may exercise Dice's file picker with the user-approved source
+        DOCX when bullet curation has no safe, non-identical change to make.  This is not
+        a curation fallback for submission: normal runs retain the fail-closed result.
+        """
+
+        preparation = self.prepare_selected(job, decision)
+        if (
+            preparation.eligible
+            or self.mode is not ResumeMode.AI_BULLETS
+            or preparation.reason not in _VERIFY_ONLY_AI_FALLBACK_REASONS
+            or not decision.eligible
+        ):
+            return preparation
+        return ResumePreparation(
+            eligible=True,
+            reason=(
+                "Verify-only fallback: AI found no safe non-identical bullet edit; using "
+                "the approved base resume to verify Dice upload only."
+            ),
+            decision=decision,
+            prepared=PreparedResume(
+                path=decision.selected_path,
+                decision=decision,
+                tailored=False,
+                verification_fallback=True,
+            ),
+        )
+
     def assert_prepared_resume_ready(
         self,
         job: JobPosting,
@@ -334,6 +379,18 @@ class ResumeService:
         if self.mode is not ResumeMode.AI_BULLETS:
             return output_digest
         source_path = prepared.decision.selected_path
+        if prepared.verification_fallback:
+            if prepared.tailored or prepared.path.resolve() != source_path.resolve():
+                raise ResumeTailoringError(
+                    "Verification fallback must use the exact approved base resume."
+                )
+            try:
+                validate_resume_path(source_path, tailored=True)
+            except ResumeConfigurationError as exc:
+                raise ResumeTailoringError(
+                    "Verification fallback base resume is no longer valid."
+                ) from exc
+            return output_digest
         if not self._cached_ai_output_is_valid(job, source_path, prepared.path):
             raise ResumeTailoringError(
                 "AI-tailored resume changed after validation; the application was skipped."
@@ -435,7 +492,7 @@ class ResumeService:
             plan = validate_bullet_rewrite_plan(raw_plan, job, bullets, source_text)
         except ResumeTailoringError as first_error:
             retry_plan = getattr(self._bullet_planner, "retry_plan", None)
-            if str(first_error) != _RETRYABLE_AI_BULLET_VALIDATION_ERROR or not callable(
+            if str(first_error) not in _RETRYABLE_AI_BULLET_VALIDATION_ERRORS or not callable(
                 retry_plan
             ):
                 raise
@@ -448,10 +505,7 @@ class ResumeService:
                     source_text,
                 )
             except ResumeTailoringError as retry_error:
-                raise ResumeTailoringError(
-                    "AI bullet rewrite remained unsupported by cited source bullets after one "
-                    "conservative retry."
-                ) from retry_error
+                raise ResumeTailoringError(str(retry_error)) from retry_error
             except Exception as retry_error:
                 raise ResumeTailoringError(
                     "OpenAI could not produce a conservative bullet rewrite retry."

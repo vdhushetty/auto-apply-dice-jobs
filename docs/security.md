@@ -59,7 +59,10 @@ override is captured before the worker starts. Preview neither requires a key no
 OpenAI client.
 
 Provider timeouts, refusals, malformed results, unsafe plans, or missing editable content skip the
-job. There is no silent generated-to-static fallback.
+job. There is no generated-to-static fallback in Submit mode. The sole exception is an explicit,
+visible **verify-only fallback**: when AI reports no safe non-identical bullet change, the
+one-job, no-submit upload check may select the exact user-approved base DOCX to prove Dice's
+filename flow. It cannot advance or submit an application.
 
 ## Document and submission integrity
 

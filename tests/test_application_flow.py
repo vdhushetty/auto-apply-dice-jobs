@@ -288,6 +288,39 @@ class PreparedService:
 
 
 @dataclass
+class VerificationFallbackService:
+    resume_path: Path
+    verify_prepare_called: bool = False
+
+    def evaluate(self, job):  # type: ignore[no-untyped-def]
+        decision = MatchDecision(
+            selected_profile=CloudProfile.AWS,
+            selected_path=self.resume_path,
+            score=80,
+            threshold=35,
+            eligible=True,
+        )
+        return ResumePreparation(eligible=True, reason="eligible", decision=decision)
+
+    def prepare_selected(self, job, decision):  # type: ignore[no-untyped-def]
+        raise AssertionError("verification must use its explicit no-submit preparation path")
+
+    def prepare_selected_for_verification(self, job, decision):  # type: ignore[no-untyped-def]
+        self.verify_prepare_called = True
+        return ResumePreparation(
+            eligible=True,
+            reason="Verify-only fallback",
+            decision=decision,
+            prepared=PreparedResume(
+                path=self.resume_path,
+                decision=decision,
+                tailored=False,
+                verification_fallback=True,
+            ),
+        )
+
+
+@dataclass
 class GuardedPreparedService(PreparedService):
     fail_on_guard_call: int = 1
     guard_calls: int = 0
@@ -972,6 +1005,34 @@ def test_verify_upload_emits_secret_free_resume_and_confirmation_progress(
     assert "sk-proj" not in repr(events)
     assert all("\n" not in event.job_title for event in events)
     assert events[-1].status == ApplicationStatus.UPLOAD_VERIFIED.value
+
+
+def test_verify_upload_uses_explicit_no_submit_resume_fallback(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    resume = tmp_path / "base.docx"
+    resume.touch()
+    service = VerificationFallbackService(resume)
+    driver = WizardDriver(has_file_input=True, has_next=True)
+    monkeypatch.setattr(main_script, "_extract_job_description", lambda current: "AWS " * 50)
+    monkeypatch.setattr(main_script, "WebDriverWait", ImmediateWait)
+    events = []
+
+    result = apply_to_job_url(
+        driver,
+        {"Job Title": "AWS Engineer", "Job URL": "https://www.dice.com/job-detail/verify"},
+        service,  # type: ignore[arg-type]
+        run_mode=RunMode.VERIFY_UPLOAD,
+        progress_callback=events.append,
+    )
+
+    assert result.status is ApplicationStatus.UPLOAD_VERIFIED
+    assert service.verify_prepare_called
+    ready_event = next(
+        event for event in events if event.stage is ApplicationProgressStage.RESUME_READY
+    )
+    assert ready_event.resume_kind == "verify-only fallback"
 
 
 def test_observability_callback_failure_never_changes_application_result(
