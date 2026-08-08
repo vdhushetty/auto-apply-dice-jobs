@@ -9,6 +9,7 @@ from core.resumes.bullet_curator import (
     MAX_REPLACEMENT_BULLET_CHARS,
     EditableBullet,
     validate_bullet_rewrite_plan,
+    validate_safe_bullet_rewrite_subset,
 )
 from core.resumes.models import JobPosting, ResumeTailoringError
 
@@ -78,10 +79,7 @@ def edit(
 def test_validates_bounded_evidence_grounded_rewrite() -> None:
     raw = raw_plan(
         edit(
-            replacements=[
-                "Built Python and AWS Glue pipelines processing 10 TB daily.",
-                "Improved SQL monitoring and reduced failures by 20%.",
-            ],
+            replacements=["Built Python and AWS Glue pipelines processing 10 TB daily."],
             sources=["experience-1-bullet-1", "experience-1-bullet-2"],
         )
     )
@@ -90,7 +88,7 @@ def test_validates_bounded_evidence_grounded_rewrite() -> None:
 
     assert plan.reason_code == "ok"
     assert plan.edits[0].bullet_id == "experience-1-bullet-1"
-    assert len(plan.edits[0].replacement_bullets) == 2
+    assert len(plan.edits[0].replacement_bullets) == 1
     assert plan.edits[0].source_bullet_ids == (
         "experience-1-bullet-1",
         "experience-1-bullet-2",
@@ -158,10 +156,10 @@ def test_rejects_duplicate_normalized_replacement_text_across_edits() -> None:
     with pytest.raises(ResumeTailoringError, match="across edits"):
         validate_bullet_rewrite_plan(
             raw_plan(
-                edit(replacements=["Supported reliable data delivery."]),
+                edit(replacements=["Built reliable data pipelines for business reporting."]),
                 edit(
                     bullet_id="experience-1-bullet-2",
-                    replacements=["  SUPPORTED reliable data delivery.  "],
+                    replacements=["  BUILT reliable data pipelines for business reporting.  "],
                     sources=["experience-1-bullet-2"],
                 ),
             ),
@@ -198,6 +196,21 @@ def test_rejects_technology_found_elsewhere_but_absent_from_cited_role() -> None
         validate_bullet_rewrite_plan(raw, job(), bullets(), resume_text())
 
 
+def test_safe_subset_retains_supported_edits_and_discards_ungrounded_edits() -> None:
+    raw = raw_plan(
+        edit(replacements=["Built Python and AWS Glue pipelines processing 10 TB daily."]),
+        edit(
+            bullet_id="experience-1-bullet-2",
+            replacements=["Improved Terraform monitoring and reduced failures by 20%."],
+            sources=["experience-1-bullet-2"],
+        ),
+    )
+
+    plan = validate_safe_bullet_rewrite_subset(raw, job(), bullets(), resume_text())
+
+    assert [item.bullet_id for item in plan.edits] == ["experience-1-bullet-1"]
+
+
 def test_rejects_numeric_token_absent_from_cited_source_bullets() -> None:
     # 20 exists elsewhere in the resume, but it is not supported by the cited bullet.
     raw = raw_plan(
@@ -209,7 +222,9 @@ def test_rejects_numeric_token_absent_from_cited_source_bullets() -> None:
 
 
 def test_rejects_new_numeric_token_attached_to_a_unit() -> None:
-    raw = raw_plan(edit(replacements=["Built AWS Glue pipelines processing 25TB daily."]))
+    raw = raw_plan(
+        edit(replacements=["Built AWS Glue pipelines processing 25TB daily with Python."])
+    )
 
     with pytest.raises(ResumeTailoringError, match="numeric token absent"):
         validate_bullet_rewrite_plan(raw, job(), bullets(), resume_text())
@@ -253,25 +268,12 @@ def test_rejects_empty_or_too_long_replacement(replacement: str) -> None:
         )
 
 
-def test_rejects_more_than_two_net_new_bullets() -> None:
+def test_rejects_any_paragraph_split_to_preserve_base_structure() -> None:
     raw = raw_plan(
-        edit(replacements=["Built AWS Glue pipelines with Python.", "Processed 10 TB daily."]),
-        edit(
-            bullet_id="experience-1-bullet-2",
-            replacements=["Improved SQL monitoring.", "Reduced failures by 20%."],
-            sources=["experience-1-bullet-2"],
-        ),
-        edit(
-            bullet_id="experience-2-bullet-1",
-            replacements=[
-                "Created Azure Data Factory pipelines.",
-                "Supported weekly reporting.",
-            ],
-            sources=["experience-2-bullet-1"],
-        ),
+        edit(replacements=["Built AWS Glue pipelines with Python.", "Processed 10 TB daily."])
     )
 
-    with pytest.raises(ResumeTailoringError, match="net-new bullet limit"):
+    with pytest.raises(ResumeTailoringError, match="per-edit limit"):
         validate_bullet_rewrite_plan(raw, job(), bullets(), resume_text())
 
 

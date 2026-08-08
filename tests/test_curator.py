@@ -168,7 +168,7 @@ def test_bullet_rewrite_boundary_is_bounded_private_and_instruction_safe() -> No
     assert kwargs["store"] is False
     assert kwargs["safety_identifier"] == "hashed-local-user"
     assert kwargs["text"]["format"]["strict"] is True
-    assert kwargs["text"]["format"]["schema"]["properties"]["edits"]["maxItems"] == 4
+    assert kwargs["text"]["format"]["schema"]["properties"]["edits"]["maxItems"] == 12
     assert "untrusted data" in kwargs["instructions"]
     assert "Never invent" in kwargs["instructions"]
     assert "employers or clients" in kwargs["instructions"]
@@ -176,7 +176,16 @@ def test_bullet_rewrite_boundary_is_bounded_private_and_instruction_safe() -> No
     assert "metrics or other numbers" in kwargs["instructions"]
     request_payload = json.loads(kwargs["input"])
     sent_bullet = request_payload["candidate_authored_editable_bullets"][0]
-    assert set(sent_bullet) == {"bullet_id", "text", "group_id"}
+    assert set(sent_bullet) == {
+        "bullet_id",
+        "text",
+        "section",
+        "group_id",
+        "minimum_replacement_characters",
+        "maximum_replacement_characters",
+    }
+    assert sent_bullet["minimum_replacement_characters"] < len(sent_bullet["text"])
+    assert sent_bullet["maximum_replacement_characters"] > len(sent_bullet["text"])
     assert "Private Employer" not in kwargs["input"]
     assert "OPENAI_API_KEY" not in kwargs["input"]
 

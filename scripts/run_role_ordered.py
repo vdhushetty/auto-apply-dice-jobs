@@ -31,6 +31,14 @@ from core.resumes import ResumeService
 
 LEDGER_PATH = Path(".data/role_ordered_runs/ledger.jsonl")
 _MAX_SEARCH_RESULT_PAGES = 2
+ROLE_SEARCH_ORDER = (
+    "Data Engineer",
+    "Data Analyst",
+    "Machine Learning",
+    "AI ML",
+    "Gen AI",
+    "Agentic AI",
+)
 
 
 def _load_settings() -> dict[str, Any]:
@@ -134,11 +142,9 @@ def run(
         api_key=os.environ.get("OPENAI_API_KEY"),
         safety_identity=username,
     )
-    queries = [
-        str(value).strip() for value in settings.get("search_queries", ()) if str(value).strip()
-    ]
-    if not queries:
-        raise ValueError("At least one search query is required.")
+    # Submission order is a product invariant. Preview may use custom queries, but a live
+    # role-ordered run always completes one role's results before loading the next role.
+    queries = list(ROLE_SEARCH_ORDER)
 
     known_applied = _recorded_applied_urls(ledger_path)
     seen_urls = set(known_applied)

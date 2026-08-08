@@ -198,6 +198,16 @@ class _BulletRecord:
     paragraph_index: int
 
 
+@dataclass(frozen=True)
+class _ResumeItemRecord:
+    """One structure-stable paragraph exposed to whole-resume optimization."""
+
+    editable: EditableBullet
+    paragraph: Paragraph
+    paragraph_index: int
+    preserved_prefix: str = ""
+
+
 def _normalize_heading(text: str) -> str:
     return " ".join(re.sub(r"[^a-z0-9 ]+", " ", text.casefold()).split())
 
@@ -330,6 +340,40 @@ def _validate_simple_bullet_paragraph(paragraph: Paragraph, bullet_id: str) -> N
         )
 
 
+def _mixed_skill_prefix(paragraph: Paragraph, item_id: str) -> tuple[str, str]:
+    """Return a run-boundary label prefix and editable skill text without flattening styles."""
+
+    descendants = {element.tag for element in paragraph._p.iter()}
+    if descendants.intersection(_UNSUPPORTED_BULLET_TAGS):
+        raise ResumeTailoringError(f"Skill item {item_id} contains unsupported Word content.")
+    if any(child.tag not in _ALLOWED_PARAGRAPH_CHILDREN for child in paragraph._p):
+        raise ResumeTailoringError(f"Skill item {item_id} uses unsupported complex Word markup.")
+    direct_runs = [child for child in paragraph._p if child.tag == _W_R]
+    if any(
+        child.tag not in _ALLOWED_RUN_CHILDREN
+        for run_element in direct_runs
+        for child in run_element
+    ):
+        raise ResumeTailoringError(f"Skill item {item_id} uses unsupported complex run content.")
+
+    text_runs = [run for run in paragraph.runs if run.text]
+    leading = ""
+    boundary_index = -1
+    for index, run in enumerate(text_runs[:-1]):
+        leading += run.text
+        if leading.rstrip().endswith(":"):
+            boundary_index = index
+            break
+    if boundary_index < 0 or len(leading.strip()) > 80:
+        raise ResumeTailoringError(f"Skill item {item_id} has no safe label/content run boundary.")
+    remaining = "".join(run.text for run in text_runs[boundary_index + 1 :])
+    editable_text = remaining.strip()
+    if not editable_text:
+        raise ResumeTailoringError(f"Skill item {item_id} has no editable content after its label.")
+    leading_whitespace = remaining[: len(remaining) - len(remaining.lstrip())]
+    return f"{leading}{leading_whitespace}", editable_text
+
+
 def _collect_bullet_records(document: Any) -> tuple[_BulletRecord, ...]:
     records: list[_BulletRecord] = []
     section_label = "other"
@@ -394,6 +438,86 @@ def collect_editable_bullets(document: Any) -> tuple[EditableBullet, ...]:
     """Collect simple resume bullets and assign deterministic paragraph-based IDs."""
 
     return tuple(record.editable for record in _collect_bullet_records(document))
+
+
+def _collect_resume_item_records(document: Any) -> tuple[_ResumeItemRecord, ...]:
+    """Collect safe summary, skills, experience, and project paragraphs in document order."""
+
+    try:
+        bullet_records = _collect_bullet_records(document)
+    except ResumeTailoringError as exc:
+        if "did not contain any safely editable bullet points" not in str(exc):
+            raise
+        bullet_records = ()
+    bullets_by_index = {record.paragraph_index: record for record in bullet_records}
+    records: list[_ResumeItemRecord] = []
+    section_kind = "other"
+
+    for paragraph_index, paragraph in enumerate(_iter_body_paragraphs(document)):
+        bullet_record = bullets_by_index.get(paragraph_index)
+        if bullet_record is not None:
+            records.append(
+                _ResumeItemRecord(
+                    editable=bullet_record.editable,
+                    paragraph=paragraph,
+                    paragraph_index=paragraph_index,
+                    preserved_prefix="",
+                )
+            )
+            continue
+
+        text = paragraph.text.strip()
+        if not text:
+            continue
+        if _is_heading_like(paragraph):
+            detected_kind = _section_kind(text)
+            level = _heading_level(paragraph)
+            if detected_kind is not None or level == 1:
+                section_kind = detected_kind or "other"
+            continue
+        if section_kind not in {"summary", "skills"}:
+            continue
+        if len(text) > MAX_REPLACEMENT_BULLET_CHARS:
+            continue
+
+        item_id = f"{section_kind}-{paragraph_index:04d}"
+        preserved_prefix = ""
+        editable_text = text
+        try:
+            _validate_simple_bullet_paragraph(paragraph, item_id)
+        except ResumeTailoringError:
+            if section_kind != "skills":
+                continue
+            try:
+                preserved_prefix, editable_text = _mixed_skill_prefix(paragraph, item_id)
+            except ResumeTailoringError:
+                continue
+        records.append(
+            _ResumeItemRecord(
+                editable=EditableBullet(
+                    bullet_id=item_id,
+                    text=editable_text,
+                    section=section_kind,
+                    group_id=f"{section_kind}-section",
+                ),
+                paragraph=paragraph,
+                paragraph_index=paragraph_index,
+                preserved_prefix=preserved_prefix,
+            )
+        )
+
+    if not records:
+        raise ResumeTailoringError(
+            "The resume did not contain safely editable summary, skills, experience, or project "
+            "content."
+        )
+    return tuple(sorted(records, key=lambda record: record.paragraph_index))
+
+
+def collect_editable_resume_items(document: Any) -> tuple[EditableBullet, ...]:
+    """Return all structure-stable text items available to the AI optimizer."""
+
+    return tuple(record.editable for record in _collect_resume_item_records(document))
 
 
 def _validate_replacement_text(text: str) -> None:
@@ -471,6 +595,40 @@ def _replace_paragraph_text(paragraph: Paragraph, replacement: str) -> None:
         raise ResumeTailoringError("A targeted bullet no longer has editable text.")
     text_runs[0].text = replacement
     for run in text_runs[1:]:
+        run.text = ""
+
+
+def _replace_paragraph_text_after_prefix(
+    paragraph: Paragraph,
+    preserved_prefix: str,
+    replacement: str,
+) -> None:
+    if not preserved_prefix:
+        _replace_paragraph_text(paragraph, replacement)
+        return
+    text_runs = [run for run in paragraph.runs if run.text]
+    original = "".join(run.text for run in text_runs)
+    if not original.startswith(preserved_prefix):
+        raise ResumeTailoringError("A labelled skill paragraph changed before optimization.")
+
+    prefix_length = len(preserved_prefix)
+    consumed = 0
+    target_index: int | None = None
+    prefix_fragment = ""
+    for index, run in enumerate(text_runs):
+        next_consumed = consumed + len(run.text)
+        if prefix_length < next_consumed:
+            target_index = index
+            prefix_fragment = run.text[: prefix_length - consumed]
+            break
+        if prefix_length == next_consumed:
+            target_index = index + 1
+            break
+        consumed = next_consumed
+    if target_index is None or target_index >= len(text_runs):
+        raise ResumeTailoringError("A labelled skill paragraph has no editable content run.")
+    text_runs[target_index].text = prefix_fragment + replacement
+    for run in text_runs[target_index + 1 :]:
         run.text = ""
 
 
@@ -556,6 +714,178 @@ def _package_part_equal(name: str, source_blob: bytes, output_blob: bytes) -> bo
     if name == "[Content_Types].xml" or name.endswith(".rels"):
         return _unordered_registry_xml_equal(source_root, output_root)
     return _canonical_xml(source_root) == _canonical_xml(output_root)
+
+
+def _validated_resume_optimization_map(
+    plan: ValidatedBulletRewritePlan,
+    records: tuple[_ResumeItemRecord, ...],
+) -> dict[str, str]:
+    records_by_id = {record.editable.bullet_id: record for record in records}
+    if not plan.edits:
+        raise ResumeTailoringError("The resume optimization plan did not contain any edits.")
+    if len(plan.edits) > MAX_EDITED_BULLETS:
+        raise ResumeTailoringError("The resume optimization plan exceeded the local edit limit.")
+
+    edit_map: dict[str, str] = {}
+    normalized_replacements: set[str] = set()
+    for edit in plan.edits:
+        if edit.bullet_id in edit_map:
+            raise ResumeTailoringError(
+                "The resume optimization plan targeted a paragraph more than once."
+            )
+        record = records_by_id.get(edit.bullet_id)
+        if record is None:
+            raise ResumeTailoringError(
+                "The resume optimization plan referenced an unknown paragraph ID."
+            )
+        if len(edit.replacement_bullets) != 1:
+            raise ResumeTailoringError(
+                "Structure-preserving optimization requires exactly one replacement paragraph."
+            )
+        replacement = edit.replacement_bullets[0]
+        _validate_replacement_text(replacement)
+        normalized = " ".join(replacement.split()).casefold()
+        if normalized in normalized_replacements:
+            raise ResumeTailoringError(
+                "The resume optimization plan contained duplicate replacement text."
+            )
+        if normalized == " ".join(record.editable.text.split()).casefold():
+            raise ResumeTailoringError("The resume optimization plan contained a no-op edit.")
+        normalized_replacements.add(normalized)
+        edit_map[edit.bullet_id] = replacement
+    return edit_map
+
+
+def validate_optimized_resume_docx(
+    source_path: Path,
+    output_path: Path,
+    plan: ValidatedBulletRewritePlan,
+) -> None:
+    """Prove that only authorized paragraph text changed and structure stayed identical."""
+
+    from docx import Document
+
+    source = validate_resume_path(source_path, tailored=True)
+    output = validate_resume_path(output_path, tailored=True)
+    try:
+        source_document = Document(str(source))
+        records = _collect_resume_item_records(source_document)
+    except ResumeTailoringError:
+        raise
+    except Exception as exc:
+        raise ResumeTailoringError("Could not inspect the source resume content.") from exc
+    edit_map = _validated_resume_optimization_map(plan, records)
+
+    source_parts = _package_parts(source)
+    output_parts = _package_parts(output)
+    if source_parts.keys() != output_parts.keys():
+        raise ResumeTailoringError("DOCX package parts changed during resume optimization.")
+    for name, source_blob in source_parts.items():
+        if name != DOCUMENT_PART and not _package_part_equal(name, source_blob, output_parts[name]):
+            raise ResumeTailoringError(
+                "A non-document DOCX part changed during resume optimization."
+            )
+
+    source_root = _parse_document_xml(source_parts[DOCUMENT_PART])
+    output_root = _parse_document_xml(output_parts[DOCUMENT_PART])
+    source_paragraphs = tuple(source_root.iter(_W_P))
+    output_paragraphs = tuple(output_root.iter(_W_P))
+    if len(output_paragraphs) != len(source_paragraphs):
+        raise ResumeTailoringError(
+            "Resume optimization added or removed paragraphs and changed the base structure."
+        )
+
+    records_by_index = {record.paragraph_index: record for record in records}
+    authorized_nodes: list[tuple[Any, Any]] = []
+    for paragraph_index, (source_paragraph, output_paragraph) in enumerate(
+        zip(source_paragraphs, output_paragraphs, strict=True)
+    ):
+        record = records_by_index.get(paragraph_index)
+        if record is None:
+            if _canonical_xml(source_paragraph) != _canonical_xml(output_paragraph):
+                raise ResumeTailoringError(
+                    "Non-target resume content or formatting changed during optimization."
+                )
+            continue
+        replacement = edit_map.get(record.editable.bullet_id)
+        if replacement is None:
+            if _canonical_xml(source_paragraph) != _canonical_xml(output_paragraph):
+                raise ResumeTailoringError(
+                    "Non-target resume content or formatting changed during optimization."
+                )
+            continue
+        if _paragraph_structure(output_paragraph) != _paragraph_structure(source_paragraph):
+            raise ResumeTailoringError(
+                "A targeted resume paragraph's structure or formatting changed."
+            )
+        if _paragraph_text(output_paragraph) != f"{record.preserved_prefix}{replacement}":
+            raise ResumeTailoringError(
+                "A targeted resume paragraph did not contain its validated text."
+            )
+        authorized_nodes.append((source_paragraph, output_paragraph))
+
+    for source_paragraph, output_paragraph in reversed(authorized_nodes):
+        parent = output_paragraph.getparent()
+        if parent is None:
+            raise ResumeTailoringError("An optimized resume paragraph became detached.")
+        parent.replace(output_paragraph, deepcopy(source_paragraph))
+    if _canonical_xml(source_root) != _canonical_xml(output_root):
+        raise ResumeTailoringError(
+            "DOCX structure changed outside the authorized resume text edits."
+        )
+
+
+def create_optimized_resume_docx(
+    source_path: Path,
+    output_path: Path,
+    plan: ValidatedBulletRewritePlan,
+) -> Path:
+    """Create an atomic, in-place-text-only optimized copy of the base resume."""
+
+    from docx import Document
+
+    source = validate_resume_path(source_path, tailored=True)
+    destination = output_path.expanduser()
+    if destination.suffix.casefold() != ".docx":
+        raise ResumeTailoringError("AI-optimized resume output must be a DOCX file.")
+    if destination.resolve(strict=False) == source:
+        raise ResumeTailoringError("The source resume must never be overwritten.")
+
+    try:
+        document = Document(str(source))
+        records = _collect_resume_item_records(document)
+        edit_map = _validated_resume_optimization_map(plan, records)
+    except ResumeTailoringError:
+        raise
+    except Exception as exc:
+        raise ResumeTailoringError("Could not prepare the source resume for optimization.") from exc
+
+    for record in records:
+        replacement = edit_map.get(record.editable.bullet_id)
+        if replacement is not None:
+            _replace_paragraph_text_after_prefix(
+                record.paragraph,
+                record.preserved_prefix,
+                replacement,
+            )
+
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp.docx")
+    try:
+        document.save(str(temporary))
+        if os.name != "nt":
+            os.chmod(temporary, 0o600)
+        validate_optimized_resume_docx(source, temporary, plan)
+        os.replace(temporary, destination)
+        if os.name != "nt":
+            os.chmod(destination, 0o600)
+    except ResumeTailoringError:
+        temporary.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        temporary.unlink(missing_ok=True)
+        raise ResumeTailoringError("Could not create the optimized resume.") from exc
+    return destination
 
 
 def validate_bullet_rewritten_docx(

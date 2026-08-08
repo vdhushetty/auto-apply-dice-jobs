@@ -23,8 +23,8 @@ answering or accepting screening questions and consents on the user's behalf.
 - `.env` contains Dice credentials and optionally an OpenAI key; it is ignored and must remain
   local with restrictive file permissions. The masked API-key field is persisted only when its
   explicit checkbox is selected; the key never enters settings JSON, manifests, reports, or logs.
-- A rejected AI bullet plan may receive one conservative retry, but each response is validated
-  locally against the exact cited source bullets before any DOCX is created or uploaded.
+- A rejected AI optimization plan may receive one conservative retry, but each response is
+  validated locally against exact cited source items before any DOCX is created or uploaded.
 - `config/settings.local.json` contains personal paths and the selected non-secret AI review
   policy; it is ignored.
 - Source resumes and generated `.data/` files contain PII and must not enter Git, fixtures, logs,
@@ -51,9 +51,10 @@ Schema compliance is not authorization. Local validation additionally requires:
 - no additions, omissions, duplicates, or renamed skills; and
 - at least one meaningful order change.
 
-AI bullet tailoring separately limits plans to four target experience bullets and two net-new
-bullets. Every replacement must cite its target/source IDs, preserve source-supported technology
-and numeric claims, avoid duplicate text, and leave protected resume sections untouched. The
+AI resume optimization limits plans to twelve in-place summary, skills, experience, or project
+paragraph replacements and permits no net-new paragraphs. Every replacement must cite its
+target/source IDs, preserve source-supported technology and numeric claims, remain within a
+section-sensitive length budget, avoid duplicate text, and leave protected content untouched. The
 default model is `gpt-5.6-sol` with low reasoning; an intentional `OPENAI_MODEL` environment
 override is captured before the worker starts. Preview neither requires a key nor constructs an
 OpenAI client.
@@ -73,15 +74,15 @@ controls, text boxes, and altChunk content are rejected. Static PDFs are never e
 
 Every generated DOCX is rendered through LibreOffice and must retain the source page count. A
 page-count change deletes the file and skips the job. Skill-order cache manifests bind source and
-output hashes to a layout-verified artifact. AI bullet caches additionally store the validated
-plan and bind the job/model/prompt; cached copies rerun bullet-only/non-target structure
+output hashes to a layout-verified artifact. AI optimization caches additionally store the validated
+plan and bind the job/model/prompt; cached copies rerun in-place-text-only/non-target structure
 validation. When `review_before_apply` is selected, the app opens each AI-generated file and
 records approval bound to exact source/output/job/manifest hashes before upload. Any later change
 invalidates that approval. When `skip_review` is selected, the human-inspection callback is
 omitted, but all evidence, structure, page-count, matching, filename, form, and confirmation
 checks remain mandatory. Skip review is not a validation bypass.
 
-The GUI requires one of the two review policies before starting AI bullet automation and repeats
+The GUI requires one of the two review policies before starting AI resume optimization and repeats
 the selected policy in the per-run confirmation. The Skip review confirmation states that it
 bypasses only human inspection. Verify Upload also warns that Dice may retain drafts.
 
@@ -120,4 +121,4 @@ including job-description or resume bodies.
   fail-closed baseline, not a guarantee of identical rendering in every Word version.
 - Deterministic checks cannot prove that every generated phrase matches the user's intended
   meaning. `review_before_apply` mitigates that risk; selecting `skip_review` explicitly accepts
-  it for bounded, locally validated bullet changes.
+  it for bounded, locally validated resume changes.

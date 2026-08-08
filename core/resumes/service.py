@@ -19,14 +19,16 @@ from .bullet_curator import (
     MAX_REPLACEMENTS_PER_EDIT,
     MAX_SOURCE_BULLETS_PER_EDIT,
     BulletRewritePlanner,
+    EditableBullet,
     ValidatedBulletEdit,
     ValidatedBulletRewritePlan,
     validate_bullet_rewrite_plan,
+    validate_safe_bullet_rewrite_subset,
 )
 from .bullet_documents import (
-    collect_editable_bullets,
-    create_bullet_rewritten_docx,
-    validate_bullet_rewritten_docx,
+    collect_editable_resume_items,
+    create_optimized_resume_docx,
+    validate_optimized_resume_docx,
 )
 from .curator import (
     PROMPT_VERSION,
@@ -72,7 +74,12 @@ _RETRYABLE_AI_BULLET_VALIDATION_ERRORS = frozenset(
     {
         "Bullet rewrite introduced a technology absent from its cited source bullets.",
         "Bullet rewrite edit is a no-op.",
+        "Bullet rewrite changed the target paragraph length beyond its safe budget.",
     }
+)
+_RETRYABLE_AI_LAYOUT_ERROR_MARKERS = (
+    "changed the rendered page count",
+    "moved a protected section heading",
 )
 _VERIFY_ONLY_AI_FALLBACK_REASONS = frozenset(
     {
@@ -83,6 +90,48 @@ _VERIFY_ONLY_AI_FALLBACK_REASONS = frozenset(
 )
 LayoutVerifier = Callable[[Path, Path], None]
 ReviewCallback = Callable[[JobPosting, Path, str], bool]
+
+
+def _layout_backoff_plans(
+    plan: ValidatedBulletRewritePlan,
+    editable_items: tuple[EditableBullet, ...],
+) -> tuple[ValidatedBulletRewritePlan, ...]:
+    """Progressively reduce a validated plan while preserving model priority order."""
+
+    if len(plan.edits) <= 1:
+        return ()
+    items_by_id = {item.bullet_id: item for item in editable_items}
+    remaining = list(plan.edits)
+    candidates: list[ValidatedBulletRewritePlan] = []
+    seen: set[tuple[str, ...]] = set()
+
+    while len(remaining) > 1:
+        drop_index = max(
+            range(len(remaining)),
+            key=lambda index: (
+                abs(
+                    len(remaining[index].replacement_bullets[0])
+                    - len(items_by_id[remaining[index].bullet_id].text)
+                ),
+                index,
+            ),
+        )
+        del remaining[drop_index]
+        key = tuple(edit.bullet_id for edit in remaining)
+        if key not in seen:
+            seen.add(key)
+            candidates.append(
+                ValidatedBulletRewritePlan(edits=tuple(remaining), reason_code=plan.reason_code)
+            )
+
+    for edit in plan.edits:
+        key = (edit.bullet_id,)
+        if key not in seen:
+            seen.add(key)
+            candidates.append(
+                ValidatedBulletRewritePlan(edits=(edit,), reason_code=plan.reason_code)
+            )
+    return tuple(candidates)
 
 
 class ResumeService:
@@ -294,7 +343,7 @@ class ResumeService:
 
         try:
             prepared_path = (
-                self._prepare_ai_bullets(job, decision.selected_path)
+                self._prepare_ai_optimized_resume(job, decision.selected_path)
                 if self.mode is ResumeMode.AI_BULLETS
                 else self._prepare_tailored(job, decision.selected_path)
             )
@@ -456,14 +505,14 @@ class ResumeService:
             raise last_layout_error
         raise ResumeTailoringError("No safe tailored resume could be generated.")
 
-    def _prepare_ai_bullets(self, job: JobPosting, source_path: Path) -> Path:
+    def _prepare_ai_optimized_resume(self, job: JobPosting, source_path: Path) -> Path:
         from docx import Document
 
         document = Document(str(source_path))
-        bullets = collect_editable_bullets(document)
-        if not bullets:
+        editable_items = collect_editable_resume_items(document)
+        if not editable_items:
             raise ResumeTailoringError(
-                "No safely editable experience bullets were found in the base DOCX."
+                "No safely editable resume content was found in the base DOCX."
             )
         if self._bullet_planner is None:
             try:
@@ -485,7 +534,7 @@ class ResumeService:
 
         self._remove_ai_artifacts(output_path)
         try:
-            raw_plan = self._bullet_planner.plan(job, bullets)
+            raw_plan = self._bullet_planner.plan(job, editable_items)
         except ResumeTailoringError:
             raise
         except Exception as exc:
@@ -493,8 +542,9 @@ class ResumeService:
         source_text = next(
             variant.text for variant in self._variants if variant.path == source_path
         )
+        used_retry = False
         try:
-            plan = validate_bullet_rewrite_plan(raw_plan, job, bullets, source_text)
+            plan = validate_bullet_rewrite_plan(raw_plan, job, editable_items, source_text)
         except ResumeTailoringError as first_error:
             retry_plan = getattr(self._bullet_planner, "retry_plan", None)
             if str(first_error) not in _RETRYABLE_AI_BULLET_VALIDATION_ERRORS or not callable(
@@ -502,33 +552,116 @@ class ResumeService:
             ):
                 raise
             try:
-                retry_raw_plan = retry_plan(job, bullets)
-                plan = validate_bullet_rewrite_plan(
-                    retry_raw_plan,
-                    job,
-                    bullets,
-                    source_text,
-                )
+                used_retry = True
+                retry_raw_plan = retry_plan(job, editable_items)
+                try:
+                    plan = validate_bullet_rewrite_plan(
+                        retry_raw_plan,
+                        job,
+                        editable_items,
+                        source_text,
+                    )
+                except ResumeTailoringError as retry_validation_error:
+                    if str(retry_validation_error) not in _RETRYABLE_AI_BULLET_VALIDATION_ERRORS:
+                        raise
+                    plan = validate_safe_bullet_rewrite_subset(
+                        retry_raw_plan,
+                        job,
+                        editable_items,
+                        source_text,
+                    )
             except ResumeTailoringError as retry_error:
                 raise ResumeTailoringError(str(retry_error)) from retry_error
             except Exception as retry_error:
                 raise ResumeTailoringError(
                     "OpenAI could not produce a conservative bullet rewrite retry."
                 ) from retry_error
-        try:
-            create_bullet_rewritten_docx(source_path, output_path, plan)
-            validate_bullet_rewritten_docx(source_path, output_path, plan)
+
+        def materialize(validated_plan: ValidatedBulletRewritePlan) -> None:
+            create_optimized_resume_docx(source_path, output_path, validated_plan)
+            validate_optimized_resume_docx(source_path, output_path, validated_plan)
             if self._layout_verifier is None:
-                raise ResumeTailoringError("AI bullet mode has no layout verifier.")
+                raise ResumeTailoringError("AI resume optimization has no layout verifier.")
             self._layout_verifier(source_path, output_path)
-            self._write_ai_cache_manifest(job, source_path, output_path, plan)
+            self._write_ai_cache_manifest(job, source_path, output_path, validated_plan)
+
+        def materialize_backoff(validated_plan: ValidatedBulletRewritePlan) -> Path | None:
+            last_layout_error: ResumeTailoringError | None = None
+            for candidate in _layout_backoff_plans(validated_plan, editable_items):
+                self._remove_ai_artifacts(output_path)
+                try:
+                    materialize(candidate)
+                    return output_path
+                except ResumeTailoringError as candidate_error:
+                    if not any(
+                        marker in str(candidate_error)
+                        for marker in _RETRYABLE_AI_LAYOUT_ERROR_MARKERS
+                    ):
+                        raise
+                    last_layout_error = candidate_error
+            if last_layout_error is not None:
+                raise last_layout_error
+            return None
+
+        try:
+            materialize(plan)
             return output_path
-        except ResumeTailoringError:
+        except ResumeTailoringError as first_materialization_error:
+            retry_plan = getattr(self._bullet_planner, "retry_plan", None)
+            retryable_layout_error = any(
+                marker in str(first_materialization_error)
+                for marker in _RETRYABLE_AI_LAYOUT_ERROR_MARKERS
+            )
             self._remove_ai_artifacts(output_path)
-            raise
+            if not retryable_layout_error:
+                raise
+            if used_retry or not callable(retry_plan):
+                backed_off_output = materialize_backoff(plan)
+                if backed_off_output is not None:
+                    return backed_off_output
+                raise
+            try:
+                retry_raw_plan = retry_plan(job, editable_items)
+                try:
+                    retry_validated_plan = validate_bullet_rewrite_plan(
+                        retry_raw_plan,
+                        job,
+                        editable_items,
+                        source_text,
+                    )
+                except ResumeTailoringError as retry_validation_error:
+                    if str(retry_validation_error) not in _RETRYABLE_AI_BULLET_VALIDATION_ERRORS:
+                        raise
+                    retry_validated_plan = validate_safe_bullet_rewrite_subset(
+                        retry_raw_plan,
+                        job,
+                        editable_items,
+                        source_text,
+                    )
+                try:
+                    materialize(retry_validated_plan)
+                    return output_path
+                except ResumeTailoringError as retry_materialization_error:
+                    if not any(
+                        marker in str(retry_materialization_error)
+                        for marker in _RETRYABLE_AI_LAYOUT_ERROR_MARKERS
+                    ):
+                        raise
+                    backed_off_output = materialize_backoff(retry_validated_plan)
+                    if backed_off_output is not None:
+                        return backed_off_output
+                    raise
+            except ResumeTailoringError:
+                self._remove_ai_artifacts(output_path)
+                raise
+            except Exception as retry_error:
+                self._remove_ai_artifacts(output_path)
+                raise ResumeTailoringError(
+                    "OpenAI could not repair resume pagination safely."
+                ) from retry_error
         except Exception as exc:
             self._remove_ai_artifacts(output_path)
-            raise ResumeTailoringError("AI bullet resume generation failed safely.") from exc
+            raise ResumeTailoringError("AI resume optimization failed safely.") from exc
 
     @staticmethod
     def _serialize_bullet_plan(plan: ValidatedBulletRewritePlan) -> dict[str, Any]:
@@ -622,7 +755,7 @@ class ResumeService:
                 return False
             plan = self._deserialize_bullet_plan(manifest.get("validated_plan"))
             validate_resume_path(output_path, tailored=True)
-            validate_bullet_rewritten_docx(source_path, output_path, plan)
+            validate_optimized_resume_docx(source_path, output_path, plan)
             return True
         except Exception:
             return False
@@ -646,6 +779,7 @@ class ResumeService:
             "prompt_version": BULLET_REWRITE_PROMPT_VERSION,
             "model": self._bullet_planner.model if self._bullet_planner is not None else "",
             "validated_plan": self._serialize_bullet_plan(plan),
+            "optimization_audit": self._optimization_audit(job, source_path, output_path),
         }
         temporary_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
         if temporary_path.stat().st_size == 0:
@@ -653,6 +787,24 @@ class ResumeService:
         if os.name != "nt":
             os.chmod(temporary_path, 0o600)
         temporary_path.replace(manifest_path)
+
+    @staticmethod
+    def _optimization_audit(
+        job: JobPosting,
+        source_path: Path,
+        output_path: Path,
+    ) -> dict[str, list[str]]:
+        """Record technology coverage without persisting resume or JD bodies."""
+
+        source_terms = extract_technology_terms(extract_resume_text(source_path))
+        output_terms = extract_technology_terms(extract_resume_text(output_path))
+        job_terms = extract_technology_terms(f"{job.title}\n{job.description}")
+        supported = job_terms.intersection(source_terms)
+        return {
+            "supported_job_terms": sorted(supported),
+            "incorporated_job_terms": sorted(job_terms.intersection(output_terms)),
+            "unsupported_job_terms": sorted(job_terms.difference(source_terms)),
+        }
 
     def _require_review_approval(
         self,

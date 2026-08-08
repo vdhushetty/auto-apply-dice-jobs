@@ -120,7 +120,7 @@ def test_role_run_finishes_current_results_page_before_loading_next_page(
         role_ordered,
         "_load_settings",
         lambda: {
-            "search_queries": ["Data Engineer"],
+            "search_queries": list(role_ordered.ROLE_SEARCH_ORDER),
             "include_keywords": [],
             "exclude_keywords": [],
         },
@@ -133,9 +133,11 @@ def test_role_run_finishes_current_results_page_before_loading_next_page(
     monkeypatch.setattr(role_ordered, "get_web_driver", lambda **kwargs: Driver())
     monkeypatch.setattr(role_ordered, "authenticate_dice_session", lambda *args: (True, ""))
 
-    def fetch(_driver, _query, *_args, **kwargs):
+    def fetch(_driver, query, *_args, **kwargs):
         page = kwargs["start_page"]
-        sequence.append(f"fetch:{page}")
+        sequence.append(f"fetch:{query}:{page}")
+        if query != "Data Engineer":
+            return ([], [])
         return (
             [
                 {
@@ -156,4 +158,74 @@ def test_role_run_finishes_current_results_page_before_loading_next_page(
     monkeypatch.setattr(role_ordered, "apply_to_job_url", apply)
 
     assert role_ordered.run(1, skip_review=True, ledger_path=tmp_path / "ledger.jsonl") == 1
-    assert sequence == ["fetch:1", "apply:Page 1", "fetch:2", "apply:Page 2"]
+    assert sequence[:4] == [
+        "fetch:Data Engineer:1",
+        "apply:Page 1",
+        "fetch:Data Engineer:2",
+        "apply:Page 2",
+    ]
+
+
+def test_role_run_uses_fixed_role_and_result_order(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    class Driver:
+        def quit(self) -> None:
+            pass
+
+    sequence: list[str] = []
+    monkeypatch.setenv("DICE_USERNAME", "candidate@example.com")
+    monkeypatch.setenv("DICE_PASSWORD", "not-a-real-password")
+    monkeypatch.setattr(role_ordered, "load_dotenv", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        role_ordered,
+        "_load_settings",
+        lambda: {
+            # Live submission must not inherit an accidentally reordered UI value.
+            "search_queries": list(reversed(role_ordered.ROLE_SEARCH_ORDER)),
+            "include_keywords": [],
+            "exclude_keywords": [],
+        },
+    )
+    monkeypatch.setattr(
+        role_ordered.ResumeService,
+        "from_settings",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(role_ordered, "get_web_driver", lambda **kwargs: Driver())
+    monkeypatch.setattr(role_ordered, "authenticate_dice_session", lambda *args: (True, ""))
+
+    def fetch(_driver, query, *_args, **kwargs):
+        sequence.append(f"search:{query}")
+        return (
+            [
+                {
+                    "Job Title": f"{query} result {position}",
+                    "Job URL": f"https://www.dice.com/job-detail/{query}-{position}",
+                }
+                for position in (1, 2)
+            ],
+            [],
+        )
+
+    def apply(_driver, job, _service, **_kwargs):
+        sequence.append(f"apply:{job['Job Title']}")
+        return ApplicationResult(ApplicationStatus.APPLIED, "Dice confirmed submission.")
+
+    monkeypatch.setattr(role_ordered, "fetch_jobs_with_requests", fetch)
+    monkeypatch.setattr(role_ordered, "apply_to_job_url", apply)
+
+    submitted = role_ordered.run(
+        2,
+        skip_review=True,
+        ledger_path=tmp_path / "ledger.jsonl",
+    )
+
+    assert submitted == 2 * len(role_ordered.ROLE_SEARCH_ORDER)
+    assert sequence == [
+        event
+        for query in role_ordered.ROLE_SEARCH_ORDER
+        for event in (
+            f"search:{query}",
+            f"apply:{query} result 1",
+            f"apply:{query} result 2",
+        )
+    ]

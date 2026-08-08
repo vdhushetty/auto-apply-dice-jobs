@@ -17,8 +17,11 @@ from core.resumes.bullet_curator import (
 from core.resumes.bullet_documents import (
     _package_part_equal,
     collect_editable_bullets,
+    collect_editable_resume_items,
     create_bullet_rewritten_docx,
+    create_optimized_resume_docx,
     validate_bullet_rewritten_docx,
+    validate_optimized_resume_docx,
 )
 from core.resumes.models import ResumeTailoringError
 
@@ -126,6 +129,125 @@ def test_collects_numbered_and_experience_fallback_bullets_with_stable_opaque_id
     assert first_collection[0].group_id == first_collection[1].group_id == "group-0001"
     assert first_collection[2].group_id == "group-0002"
     assert all("Company" not in bullet.group_id for bullet in first_collection)
+
+
+def test_collects_whole_resume_items_without_exposing_headings(tmp_path: Path) -> None:
+    source = _make_resume(tmp_path / "resume.docx")
+    document = Document(source)
+    experience_heading_index = next(
+        index
+        for index, paragraph in enumerate(document.paragraphs)
+        if paragraph.text == "Professional Experience"
+    )
+    skills_heading = document.paragraphs[experience_heading_index].insert_paragraph_before(
+        "Technical Skills"
+    )
+    skills_heading.style = document.styles["Heading 1"]
+    document.paragraphs[experience_heading_index + 1].insert_paragraph_before(
+        "Python, SQL, AWS, Spark, data quality"
+    )
+    document.save(source)
+
+    items = collect_editable_resume_items(Document(source))
+
+    assert {item.section for item in items} == {"summary", "skills", "experience"}
+    assert all("Professional" not in item.text for item in items)
+    assert any(item.text.startswith("Built reliable platforms") for item in items)
+    assert any(item.text.startswith("Python, SQL, AWS") for item in items)
+
+
+def test_whole_resume_optimization_preserves_exact_document_structure(tmp_path: Path) -> None:
+    source = _make_resume(tmp_path / "source.docx")
+    document = Document(source)
+    experience_heading_index = next(
+        index
+        for index, paragraph in enumerate(document.paragraphs)
+        if paragraph.text == "Professional Experience"
+    )
+    skills_heading = document.paragraphs[experience_heading_index].insert_paragraph_before(
+        "Technical Skills"
+    )
+    skills_heading.style = document.styles["Heading 1"]
+    document.paragraphs[experience_heading_index + 1].insert_paragraph_before(
+        "Python, SQL, AWS, Spark, data quality"
+    )
+    document.save(source)
+    source_bytes = source.read_bytes()
+    source_document = Document(source)
+    items = collect_editable_resume_items(source_document)
+    summary = next(item for item in items if item.section == "summary")
+    skills = next(item for item in items if item.section == "skills")
+    experience = next(item for item in items if item.section == "experience" and "AWS" in item.text)
+    plan = ValidatedBulletRewritePlan(
+        edits=(
+            ValidatedBulletEdit(
+                summary.bullet_id,
+                (
+                    "Built reliable AWS data platforms and governed reporting systems across "
+                    "several business teams.",
+                ),
+                (summary.bullet_id, experience.bullet_id),
+            ),
+            ValidatedBulletEdit(
+                skills.bullet_id,
+                ("AWS, Python, SQL, Spark, data quality",),
+                (skills.bullet_id, experience.bullet_id),
+            ),
+            ValidatedBulletEdit(
+                experience.bullet_id,
+                (
+                    "Built governed AWS data pipelines with Python and SQL for reliable "
+                    "business reporting.",
+                ),
+                (experience.bullet_id,),
+            ),
+        ),
+        reason_code="ok",
+    )
+
+    output = create_optimized_resume_docx(source, tmp_path / "optimized.docx", plan)
+    validate_optimized_resume_docx(source, output, plan)
+
+    output_document = Document(output)
+    assert source.read_bytes() == source_bytes
+    assert len(output_document.paragraphs) == len(source_document.paragraphs)
+    assert [p.style.name for p in output_document.paragraphs] == [
+        p.style.name for p in source_document.paragraphs
+    ]
+    assert len(output_document.tables) == len(source_document.tables)
+    assert output_document.sections[0].header.paragraphs[0].text == "Resume header"
+    assert output_document.sections[0].footer.paragraphs[0].text == "Resume footer"
+
+
+def test_optimization_preserves_mixed_format_skill_label_runs(tmp_path: Path) -> None:
+    source = tmp_path / "labelled-skills.docx"
+    document = Document()
+    document.add_heading("Technical Skills", level=1)
+    paragraph = document.add_paragraph()
+    label = paragraph.add_run("Cloud Platforms:")
+    label.bold = True
+    content = paragraph.add_run(" Azure, AWS, GCP")
+    content.bold = False
+    document.add_heading("Professional Experience", level=1)
+    document.add_paragraph(
+        "Built AWS and Azure data pipelines for governed reporting.",
+        style="List Bullet",
+    )
+    document.save(source)
+    items = collect_editable_resume_items(Document(source))
+    skill = next(item for item in items if item.section == "skills")
+    assert skill.text == "Azure, AWS, GCP"
+    plan = _plan(skill.bullet_id, "AWS, Azure, GCP")
+
+    output = create_optimized_resume_docx(source, tmp_path / "optimized.docx", plan)
+    validate_optimized_resume_docx(source, output, plan)
+
+    optimized = Document(output).paragraphs[1]
+    assert optimized.text == "Cloud Platforms: AWS, Azure, GCP"
+    assert optimized.runs[0].text == "Cloud Platforms:"
+    assert optimized.runs[0].bold is True
+    assert optimized.runs[1].text == " AWS, Azure, GCP"
+    assert optimized.runs[1].bold is False
 
 
 def test_unnumbered_role_heading_is_not_treated_as_action_verb_bullet(tmp_path: Path) -> None:
@@ -275,7 +397,7 @@ def _zip_members(path: Path):  # type: ignore[no-untyped-def]
         return [(member, archive.read(member)) for member in archive.infolist()]
 
 
-def test_two_replacements_clone_paragraph_immediately_and_preserve_direct_numbering(
+def test_structure_preserving_optimizer_rejects_paragraph_splits(
     tmp_path: Path,
 ) -> None:
     source = _make_resume(tmp_path / "source.docx")
@@ -289,19 +411,10 @@ def test_two_replacements_clone_paragraph_immediately_and_preserve_direct_number
     second_replacement = "Monitored SQL batch workflows using existing operational controls."
     plan = _plan(target.bullet_id, first_replacement, second_replacement)
 
-    output = create_bullet_rewritten_docx(source, tmp_path / "split.docx", plan)
+    with pytest.raises(ResumeTailoringError, match="insertion limit"):
+        create_bullet_rewritten_docx(source, tmp_path / "split.docx", plan)
 
-    output_document = Document(output)
-    texts = [paragraph.text for paragraph in output_document.paragraphs]
-    first_index = texts.index(first_replacement)
-    assert texts[first_index + 1] == second_replacement
-    first = output_document.paragraphs[first_index]
-    second = output_document.paragraphs[first_index + 1]
-    assert first._p.pPr.xml == second._p.pPr.xml == source_properties
-    assert first._p.pPr.numPr is not None
-    assert second._p.pPr.numPr is not None
-    assert first.runs[0].italic is True
-    assert second.runs[0].italic is True
+    assert source_properties
 
 
 def test_unknown_target_fails_closed_without_creating_output(tmp_path: Path) -> None:

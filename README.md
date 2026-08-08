@@ -21,18 +21,19 @@ navigation and retrieval, inaccurate resume content, and keyword stuffing. See t
   every returned ID is an exact permutation of candidate-authored skill items, and create a
   job-specific DOCX. The model cannot add, delete, rename, or rewrite skills or claims. The
   generated file must render to the same page count as its source or it is deleted and skipped.
-- **AI bullet tailoring (`ai_bullets`):** read the full job description and create a fresh,
-  bounded, evidence-grounded rewrite of up to four existing experience bullets for every
-  Easy Apply job. The initial score is recorded for visibility but does not reject a job. At most
-  two net-new bullets may be produced by splitting supported source material. Local validation
-  rejects technologies or quantified claims absent from the cited same-role bullets and locks
-  every non-target paragraph and structural feature. The prompt prohibits invented experience,
-  employers, dates, education, or other candidate facts. The generated DOCX must keep the source
-  page count. Before starting, the user explicitly chooses **Review before apply** or
-  **Skip review**.
+- **AI resume optimization (`ai_bullets`):** read the full job description and create a fresh,
+  evidence-grounded version of the base DOCX for every Easy Apply job. The optimizer may update
+  up to twelve safe summary, skills, experience, or project paragraphs in place. It cannot add,
+  remove, relocate, or split paragraphs; paragraph order, styles, tables, headers/footers, package
+  structure, rendered page count, and section-heading page positions must remain identical to the
+  base template. If a comprehensive plan changes pagination, the engine progressively retains the
+  highest-value safe edits until the template fits. The initial score is recorded for visibility
+  but does not reject a job. Local validation rejects technologies or quantified claims absent
+  from cited source evidence. Before starting, the user explicitly chooses **Review before
+  apply** or **Skip review**.
 
 Static and tailored modes require exactly three user-approved files labelled AWS, Azure, and GCP.
-AI bullet tailoring uses one user-approved DOCX. No personal resume files are included in the
+AI resume optimization uses one user-approved DOCX. No personal resume files are included in the
 repository.
 
 The AI review policy changes only human inspection. **Review before apply** opens each exact
@@ -46,7 +47,7 @@ The application skips instead of submitting when any of these checks fail:
 - the job description cannot be read;
 - in static or tailored mode, the best resume score is below the configured threshold;
 - tailored output is refused, malformed, unchanged, or structurally unsafe;
-- AI bullet output lacks candidate evidence, changes protected content/layout, or cannot satisfy
+- AI-optimized output lacks candidate evidence, changes protected content/layout, or cannot satisfy
   the selected review policy;
 - the posting leaves Dice instead of entering Dice Easy Apply;
 - the intended filename cannot be verified in a file input; or
@@ -66,7 +67,7 @@ Three side-effect levels are available:
   eligible jobs up to the configured limit, and never click Apply.
 - **Verify upload:** open only the single highest-ranked eligible job and make at most one resume
   file-selection attempt. Stop whether filename verification succeeds or fails; Next and Submit
-  are never clicked. Dice may retain that one draft. In AI bullet mode only, a no-op or explicit
+  are never clicked. Dice may retain that one draft. In AI optimization mode only, a no-op or explicit
   no-relevant-change plan is visibly labelled **verify-only fallback** and tests this upload using
   the approved base DOCX; Submit mode still requires a validated tailored output.
 - **Submit:** upload and submit only after all fit, upload, form, and confirmation checks pass.
@@ -108,7 +109,7 @@ OPENAI_API_KEY=
 OPENAI_MODEL=gpt-5.6-sol
 ```
 
-`OPENAI_API_KEY` is unnecessary in static mode and in Preview. AI bullet tailoring defaults to
+`OPENAI_API_KEY` is unnecessary in static mode and in Preview. AI resume optimization defaults to
 `gpt-5.6-sol` with low reasoning; `OPENAI_MODEL` intentionally overrides the non-secret model
 setting for accounts that need a different supported model. Change it only after running the
 evaluation set.
@@ -123,14 +124,14 @@ In **Settings**:
 
 1. Enter and test Dice credentials.
 2. Leave the run mode on `preview` for the first run.
-3. Choose `static`, `tailored`, or `ai_bullets` (AI bullet tailoring).
-4. Select and validate either one AWS/Azure/GCP set or one base DOCX. For AI bullet tailoring,
+3. Choose `static`, `tailored`, or `ai_bullets` (AI resume optimization).
+4. Select and validate either one AWS/Azure/GCP set or one base DOCX. For AI optimization,
    enter an API key; selecting the save checkbox writes it only to the ignored `.env` with local
    file permissions, never to settings JSON.
-5. In AI bullet mode, explicitly choose **Review before apply** (the safe default) or
+5. In AI optimization mode, explicitly choose **Review before apply** (the safe default) or
    **Skip review**. The selected stable policy is saved in the ignored local settings file.
 6. Choose the minimum match score, winner margin, and 1–15 confirmed applications per role.
-   In AI bullet mode, the score is recorded but is not a submission gate. Submit mode searches
+   In AI mode, the score is recorded but is not a submission gate. Submit mode searches
    and completes Data Engineer results first, then Data Analyst, Machine Learning, AI/ML, GenAI,
    and Agentic AI. It completes each result's full description → curated resume → upload →
    confirmation flow before opening the next result. It records confirmed/already-applied jobs
@@ -140,7 +141,7 @@ In **Settings**:
 8. Start the bot and read the mode-specific confirmation. It repeats the selected AI review
    policy; Verify Upload may leave a Dice draft.
 
-Generated skill-order files are kept under ignored `.data/tailored_resumes/`; AI bullet files and
+Generated skill-order files are kept under ignored `.data/tailored_resumes/`; AI-optimized files and
 any hash-bound review approvals are kept under ignored `.data/ai_resumes/`. Consolidated,
 run-scoped Excel and JSON reports are written under ignored `.data/runs/`.
 
@@ -195,6 +196,7 @@ Architecture, development, and risk details live in:
 - [Sample resume validation](docs/sample-validation.md)
 - [Curation safety decision](docs/decisions/0001-truth-preserving-curation.md)
 - [Explicit AI review policy decision](docs/decisions/0003-explicit-ai-review-policy.md)
+- [Whole-resume optimization decision](docs/decisions/0004-structure-preserving-whole-resume-optimization.md)
 
 ## Known limitations
 
@@ -202,11 +204,12 @@ Architecture, development, and risk details live in:
   repository initialization or sample validation.
 - Tailored mode safely reorders existing skill items; it intentionally does not rewrite prose,
   employment history, dates, metrics, education, or certifications.
-- AI bullet tailoring can rephrase or split only experience bullets backed by existing resume
-  facts. Its prompt forbids manufacturing experience, technologies, numbers, employers, dates,
-  education, or certifications. Deterministic evidence and document checks fail closed before
-  upload in both review policies. **Skip review** cannot verify whether the user agrees with the
-  wording, so use it only after testing Review before apply on representative jobs.
+- AI resume optimization can target safe summary, skills, experience, and project paragraphs
+  backed by existing resume facts. Its prompt forbids manufacturing experience, technologies,
+  numbers, employers, dates, education, or certifications. Deterministic evidence and document
+  checks fail closed before upload in both review policies. **Skip review** cannot verify whether
+  the user agrees with the wording, so use it only after testing Review before apply on
+  representative jobs.
 - Tailored mode requires parseable delimiter-based skill lists in DOCX files. Complex text boxes,
   content controls, tracked changes, or scanned documents are not supported.
 - The matcher uses a version-controlled technology taxonomy and a lexical signal. The eval set is

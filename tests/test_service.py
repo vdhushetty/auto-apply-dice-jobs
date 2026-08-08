@@ -63,7 +63,7 @@ class AIBulletPlanner:
 
     def plan(self, job: JobPosting, bullets: Sequence[EditableBullet]) -> dict[str, Any]:
         self.calls += 1
-        target = bullets[0]
+        target = next(item for item in bullets if item.section == "experience")
         return {
             "schema_version": "1",
             "outcome": "rewrite",
@@ -89,7 +89,7 @@ class RetryingAIBulletPlanner(AIBulletPlanner):
 
     def plan(self, job: JobPosting, bullets: Sequence[EditableBullet]) -> dict[str, Any]:
         self.calls += 1
-        target = bullets[1]
+        target = [item for item in bullets if item.section == "experience"][1]
         return {
             "schema_version": "1",
             "outcome": "rewrite",
@@ -105,6 +105,20 @@ class RetryingAIBulletPlanner(AIBulletPlanner):
                 }
             ],
         }
+
+    def retry_plan(
+        self,
+        job: JobPosting,
+        bullets: Sequence[EditableBullet],
+    ) -> dict[str, Any]:
+        self.retry_calls += 1
+        return super().plan(job, bullets)
+
+
+class LayoutRetryPlanner(AIBulletPlanner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.retry_calls = 0
 
     def retry_plan(
         self,
@@ -142,6 +156,46 @@ class ExplodingAIBulletPlanner:
         raise AssertionError("AI planner must not run during evaluation")
 
 
+class WholeResumePlanner:
+    model = "fake-whole-resume-model"
+
+    def plan(self, job: JobPosting, items: Sequence[EditableBullet]) -> dict[str, Any]:
+        summary = next(item for item in items if item.section == "summary")
+        skills = next(item for item in items if item.section == "skills")
+        experience = next(
+            item for item in items if item.section == "experience" and "AWS" in item.text
+        )
+        return {
+            "schema_version": "1",
+            "outcome": "rewrite",
+            "reason_code": "ok",
+            "job_evidence": [{"quote": "AWS, Python, and SQL", "priority": "required"}],
+            "edits": [
+                {
+                    "bullet_id": summary.bullet_id,
+                    "replacement_bullets": [
+                        "AWS data engineer building reliable analytics platforms and governed "
+                        "reporting systems with Python and SQL for business stakeholders."
+                    ],
+                    "source_bullet_ids": [summary.bullet_id, experience.bullet_id],
+                },
+                {
+                    "bullet_id": skills.bullet_id,
+                    "replacement_bullets": ["AWS, Python, SQL, data quality, batch workflows"],
+                    "source_bullet_ids": [skills.bullet_id, experience.bullet_id],
+                },
+                {
+                    "bullet_id": experience.bullet_id,
+                    "replacement_bullets": [
+                        "Built governed AWS data pipelines with Python and SQL for reliable "
+                        "business reporting."
+                    ],
+                    "source_bullet_ids": [experience.bullet_id],
+                },
+            ],
+        }
+
+
 def make_ai_resume(path: Path) -> Path:
     document = Document()
     document.add_heading("Professional Summary", level=1)
@@ -149,6 +203,8 @@ def make_ai_resume(path: Path) -> Path:
         "Data engineer with production experience building reliable analytics platforms and "
         "governed reporting systems for business stakeholders."
     )
+    document.add_heading("Technical Skills", level=1)
+    document.add_paragraph("Python, SQL, AWS, batch workflows, data quality")
     document.add_heading("Professional Experience", level=1)
     document.add_paragraph("Senior Data Engineer | Example Company")
     document.add_paragraph(
@@ -161,6 +217,91 @@ def make_ai_resume(path: Path) -> Path:
     )
     document.save(path)
     return path
+
+
+def test_ai_optimizer_updates_summary_skills_and_experience_without_restructuring(
+    tmp_path: Path,
+) -> None:
+    source = make_ai_resume(tmp_path / "base.docx")
+    source_document = Document(source)
+    source_paragraph_count = len(source_document.paragraphs)
+    source_styles = [paragraph.style.name for paragraph in source_document.paragraphs]
+    service = ResumeService.from_settings(
+        {
+            "resume_mode": "ai_bullets",
+            "ai_review_policy": "skip_review",
+            "ai_resume_path": str(source),
+            "ai_resume_output_dir": str(tmp_path / "ai-out"),
+            "minimum_match_score": 95,
+        },
+        bullet_planner=WholeResumePlanner(),
+        layout_verifier=lambda source_path, output_path: None,
+    )
+
+    result = service.prepare(
+        JobPosting(
+            title="AWS Data Engineer",
+            description="Required: AWS, Python, and SQL for governed data pipelines.",
+            url="https://www.dice.com/job-detail/whole-resume-optimizer",
+        )
+    )
+
+    assert result.eligible and result.prepared is not None
+    output_document = Document(result.prepared.path)
+    assert len(output_document.paragraphs) == source_paragraph_count
+    assert [paragraph.style.name for paragraph in output_document.paragraphs] == source_styles
+    output_text = "\n".join(paragraph.text for paragraph in output_document.paragraphs)
+    assert "AWS data engineer building reliable analytics platforms" in output_text
+    assert "AWS, Python, SQL, data quality, batch workflows" in output_text
+    assert "Built governed AWS data pipelines" in output_text
+
+    manifest_path = result.prepared.path.with_suffix(f"{result.prepared.path.suffix}.manifest.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert len(manifest["validated_plan"]["edits"]) == 3
+    assert {"aws", "python", "sql"} <= set(manifest["optimization_audit"]["incorporated_job_terms"])
+
+
+def test_ai_optimizer_reduces_plan_until_protected_layout_fits(tmp_path: Path) -> None:
+    source = make_ai_resume(tmp_path / "base.docx")
+    layout_calls = 0
+
+    def accept_only_one_changed_paragraph(source_path: Path, output_path: Path) -> None:
+        nonlocal layout_calls
+        layout_calls += 1
+        source_text = [paragraph.text for paragraph in Document(source_path).paragraphs]
+        output_text = [paragraph.text for paragraph in Document(output_path).paragraphs]
+        changed = sum(left != right for left, right in zip(source_text, output_text, strict=True))
+        if changed > 1:
+            raise ResumeTailoringError(
+                "Tailored resume moved a protected section heading to another rendered page "
+                "and was discarded."
+            )
+
+    service = ResumeService.from_settings(
+        {
+            "resume_mode": "ai_bullets",
+            "ai_review_policy": "skip_review",
+            "ai_resume_path": str(source),
+            "ai_resume_output_dir": str(tmp_path / "ai-out"),
+            "minimum_match_score": 20,
+        },
+        bullet_planner=WholeResumePlanner(),
+        layout_verifier=accept_only_one_changed_paragraph,
+    )
+
+    result = service.prepare(
+        JobPosting(
+            title="AWS Data Engineer",
+            description="Required: AWS, Python, and SQL for governed data pipelines.",
+            url="https://www.dice.com/job-detail/ai-layout-backoff",
+        )
+    )
+
+    assert result.eligible and result.prepared is not None
+    manifest_path = result.prepared.path.with_suffix(f"{result.prepared.path.suffix}.manifest.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert len(manifest["validated_plan"]["edits"]) == 1
+    assert layout_calls >= 2
 
 
 def make_paths(resume_factory) -> dict[str, str]:  # type: ignore[no-untyped-def]
@@ -504,6 +645,46 @@ def test_ai_bullets_retries_one_source_ungrounded_technology_plan(tmp_path: Path
     assert planner.calls == 2
     assert planner.retry_calls == 1
     assert source.exists()
+
+
+def test_ai_optimizer_retries_once_after_protected_layout_drift(tmp_path: Path) -> None:
+    source = make_ai_resume(tmp_path / "base.docx")
+    planner = LayoutRetryPlanner()
+    layout_calls = 0
+
+    def reject_first_layout(source_path: Path, output_path: Path) -> None:
+        nonlocal layout_calls
+        layout_calls += 1
+        if layout_calls == 1:
+            raise ResumeTailoringError(
+                "Tailored resume moved a protected section heading to another rendered page "
+                "and was discarded."
+            )
+
+    service = ResumeService.from_settings(
+        {
+            "resume_mode": "ai_bullets",
+            "ai_review_policy": "skip_review",
+            "ai_resume_path": str(source),
+            "ai_resume_output_dir": str(tmp_path / "ai-out"),
+            "minimum_match_score": 20,
+        },
+        bullet_planner=planner,
+        layout_verifier=reject_first_layout,
+    )
+
+    result = service.prepare(
+        JobPosting(
+            title="AWS Data Engineer",
+            description="Required: AWS, Python, and SQL data pipeline experience.",
+            url="https://www.dice.com/job-detail/ai-layout-retry",
+        )
+    )
+
+    assert result.eligible and result.prepared is not None
+    assert layout_calls == 2
+    assert planner.calls == 2
+    assert planner.retry_calls == 1
 
 
 def test_ai_bullets_verify_upload_can_use_source_after_noop_plan(tmp_path: Path) -> None:

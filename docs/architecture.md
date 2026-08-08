@@ -13,7 +13,7 @@ Dice search cards --> Dice detail page --> title + full description
                                       |                         |
                                 below threshold       static | tailored | ai_bullets
                                       |                         |
-                                    SKIP       ID-only skill order | bounded bullet plan
+                                    SKIP       ID-only skill order | whole-resume text plan
                                                                 |
                                                 local evidence/schema validation
                                                                 |
@@ -37,7 +37,7 @@ Dice Easy Apply <---- exact file path ---- verify input.files[0].name
 
 `app_tkinter.py` owns interaction and run orchestration. It reads safe defaults plus an ignored
 local override, validates resume configuration before starting, and passes immutable values to
-the worker. In AI bullet mode it requires a readonly **Review before apply** or **Skip review**
+the worker. In AI optimization mode it requires a readonly **Review before apply** or **Skip review**
 selection, persists the stable policy value locally, and repeats it in the run confirmation.
 It also retains a tested Dice session in memory for the current process, validates reuse on a
 protected profile route, and exposes secret-free structured progress in Current job, Current
@@ -64,19 +64,21 @@ cloud/data/AI terms, combines weighted title/description coverage with a small l
 scores every source resume, and enforces the local threshold.
 It also parses required bullet sections, requires a configurable winner margin, routes explicit
 single-cloud titles, and fails closed on employment restrictions requiring manual review.
-For AI bullet mode, `SingleResumeSelector` records the title/full-description score and missing
+For AI optimization mode, `SingleResumeSelector` records the title/full-description score and missing
 terms, but does not use either as an initial curation gate. It still stops explicit employment
 restrictions for manual review; the bullet validator separately rejects unsupported claims.
 
 `core/resumes/curator.py` is the only OpenAI SDK boundary. It uses the Responses API, Structured
 Outputs, `store=False`, bounded SDK retries/timeouts, fixed low reasoning, and a configurable
-model. Skill ordering sends job text plus candidate-owned skill IDs/text. AI bullet tailoring
-sends job text plus bounded editable experience bullets; contact details and protected sections
-are not sent.
+model. Skill ordering sends job text plus candidate-owned skill IDs/text. AI resume optimization
+sends job text plus bounded, safely editable summary, skills, experience, and project items;
+contact details, employers, dates, education, and other protected content are not sent.
 
-`core/resumes/bullet_curator.py` owns the AI-bullet schema and semantic validator. Plans are
-limited to four target bullets and two net-new bullets, must cite exact source/job evidence, and
-cannot introduce technologies or quantified claims absent from the cited same-role bullets.
+`core/resumes/bullet_curator.py` owns the AI optimization schema and semantic validator. Plans are
+limited to twelve one-for-one paragraph edits, must cite exact source/job evidence, remain within
+section-sensitive length budgets, and cannot introduce technologies or quantified claims absent
+from cited source items. Experience/project evidence stays within the same role group; summary
+and skills may cite supported evidence elsewhere in the resume.
 
 `core/resumes/documents.py` extracts text from DOCX/PDF for selection. Tailored mode detects
 delimiter-based skill lists in DOCX skill sections, accepts only exact ID permutations, edits a
@@ -84,12 +86,14 @@ copy, reloads it, and compares layout-sensitive structure fingerprints including
 drawing counts, and legacy objects. Unsupported tracked changes, content controls, text boxes,
 and altChunk content are rejected explicitly.
 
-`core/resumes/bullet_documents.py` locates supported experience bullets, applies a validated plan
-to a copy, and verifies that only approved bullet paragraphs changed while protected text,
-styles, geometry, headers/footers, media, drawings, and objects remain stable.
+`core/resumes/bullet_documents.py` locates safe summary, skills, experience, and project
+paragraphs, applies a validated plan in place to a copy, and verifies exact paragraph count/order,
+formatting, protected text, geometry, headers/footers, media, drawings, and objects remain stable.
 
 `core/resumes/layout.py` renders source and output through an isolated LibreOffice profile. A
-page-count change deletes the generated file and skips the application.
+page-count change or protected section-heading page shift deletes that candidate. The service
+retries once, then progressively reduces the validated edit set until a structure-safe version
+renders; the application is skipped only if no validated edit can preserve the base layout.
 
 `core/resumes/catalog.py` provides privacy-safe, network-free validation diagnostics for all
 three source files.
@@ -107,9 +111,9 @@ file.
 ## Trust boundaries and data flow
 
 - Dice HTML and job descriptions are untrusted external input.
-- Resume files contain sensitive personal data. Only extracted skill-list text or editable
-  experience bullets required by the chosen strategy are sent; full resume prose is not sent or
-  logged.
+- Resume files contain sensitive personal data. Only bounded editable summary, skills,
+  experience, and project item text required by the strategy is sent; contact details, role
+  headings, education, and full document bodies are not sent or logged.
 - OpenAI output is untrusted even with a strict schema. Exact evidence and permutations are
   revalidated locally before document changes.
 - Browser clicks and file uploads are external side effects. A GUI confirmation and Dice

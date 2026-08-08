@@ -10,14 +10,14 @@ from typing import Any, Protocol
 from .models import JobPosting, ResumeTailoringError
 from .selector import extract_technology_terms
 
-BULLET_REWRITE_PROMPT_VERSION = "resume-bullet-rewrite-v2"
+BULLET_REWRITE_PROMPT_VERSION = "whole-resume-optimization-v2"
 DEFAULT_BULLET_REWRITE_MODEL = "gpt-5.6-sol"
-MAX_EDITED_BULLETS = 4
-MAX_NET_NEW_BULLETS = 2
-MAX_REPLACEMENTS_PER_EDIT = 2
+MAX_EDITED_BULLETS = 12
+MAX_NET_NEW_BULLETS = 0
+MAX_REPLACEMENTS_PER_EDIT = 1
 MAX_SOURCE_BULLETS_PER_EDIT = 4
-MAX_REPLACEMENT_BULLET_CHARS = 500
-MAX_EDITABLE_BULLETS = 80
+MAX_REPLACEMENT_BULLET_CHARS = 1_000
+MAX_EDITABLE_BULLETS = 120
 MAX_BULLET_ID_CHARS = 128
 MAX_GROUP_ID_CHARS = 128
 MAX_JOB_EVIDENCE_ITEMS = 8
@@ -121,7 +121,7 @@ class EditableBullet:
 
 @dataclass(frozen=True)
 class ValidatedBulletEdit:
-    """A locally validated one-for-one or one-for-two bullet replacement."""
+    """A locally validated in-place paragraph replacement."""
 
     bullet_id: str
     replacement_bullets: tuple[str, ...]
@@ -130,7 +130,7 @@ class ValidatedBulletEdit:
 
 @dataclass(frozen=True)
 class ValidatedBulletRewritePlan:
-    """The bounded set of bullet edits approved for document rendering."""
+    """The bounded set of resume-item edits approved for document rendering."""
 
     edits: tuple[ValidatedBulletEdit, ...]
     reason_code: str
@@ -142,6 +142,13 @@ class BulletRewritePlanner(Protocol):
     model: str
 
     def plan(self, job: JobPosting, bullets: Sequence[EditableBullet]) -> Mapping[str, Any]: ...
+
+
+def replacement_length_bounds(item: EditableBullet) -> tuple[int, int]:
+    """Keep optimized text close to the capacity of its existing template slot."""
+
+    tolerance = max(12, int(len(item.text) * 0.10))
+    return max(20, len(item.text) - tolerance), len(item.text) + tolerance
 
 
 # The selector taxonomy covers the technologies used by matching. These additional aliases
@@ -390,7 +397,7 @@ def validate_bullet_rewrite_plan(
     if outcome != "rewrite" or reason_code != "ok":
         raise ResumeTailoringError("Bullet rewrite plan outcome is inconsistent.")
     if not 1 <= len(raw_edits) <= MAX_EDITED_BULLETS:
-        raise ResumeTailoringError("Bullet rewrite plan must edit between one and four bullets.")
+        raise ResumeTailoringError("Resume optimization must edit between one and twelve items.")
     _validate_job_evidence(raw_plan.get("job_evidence"), job, required=True)
 
     bullets_by_id = _index_bullets(bullets)
@@ -433,7 +440,10 @@ def validate_bullet_rewrite_plan(
             raise ResumeTailoringError(
                 "Bullet rewrite referenced an unknown source bullet ID."
             ) from exc
-        if any(source.group_id != target.group_id for source in source_bullets):
+        globally_supported_section = target.section.casefold() in {"summary", "skills"}
+        if not globally_supported_section and any(
+            source.group_id != target.group_id for source in source_bullets
+        ):
             raise ResumeTailoringError(
                 "Bullet rewrite source bullets must be from the target bullet's group."
             )
@@ -473,6 +483,13 @@ def validate_bullet_rewrite_plan(
         ):
             raise ResumeTailoringError("Bullet rewrite edit is a no-op.")
 
+        replacement_length = len(replacements[0])
+        minimum_length, maximum_length = replacement_length_bounds(target)
+        if not minimum_length <= replacement_length <= maximum_length:
+            raise ResumeTailoringError(
+                "Bullet rewrite changed the target paragraph length beyond its safe budget."
+            )
+
         replacement_text = "\n".join(replacements)
         replacement_technologies = _technology_terms(replacement_text)
         new_resume_technologies = replacement_technologies - resume_technologies
@@ -511,3 +528,51 @@ def validate_bullet_rewrite_plan(
     if net_new_bullets > MAX_NET_NEW_BULLETS:
         raise ResumeTailoringError("Bullet rewrite plan exceeds the net-new bullet limit.")
     return ValidatedBulletRewritePlan(edits=tuple(validated_edits), reason_code=reason_code)
+
+
+def validate_safe_bullet_rewrite_subset(
+    raw_plan: Mapping[str, Any],
+    job: JobPosting,
+    bullets: Sequence[EditableBullet],
+    resume_text: str,
+) -> ValidatedBulletRewritePlan:
+    """Retain only edits that remain valid when accumulated in response order.
+
+    This is a fail-closed recovery path for a model repair response containing a mixture of
+    locally valid and invalid edits. Each retained edit passes the complete plan validator, and
+    the final accumulated plan is validated again before it can reach document generation.
+    """
+
+    if not isinstance(raw_plan, Mapping):
+        raise ResumeTailoringError("Bullet rewrite plan is not an object.")
+    raw_edits = raw_plan.get("edits")
+    if not isinstance(raw_edits, list) or not raw_edits:
+        return validate_bullet_rewrite_plan(raw_plan, job, bullets, resume_text)
+
+    accepted_edits: list[Any] = []
+    last_error: ResumeTailoringError | None = None
+    validated: ValidatedBulletRewritePlan | None = None
+    for raw_edit in raw_edits:
+        candidate = dict(raw_plan)
+        candidate["edits"] = [*accepted_edits, raw_edit]
+        try:
+            candidate_plan = validate_bullet_rewrite_plan(
+                candidate,
+                job,
+                bullets,
+                resume_text,
+            )
+        except ResumeTailoringError as exc:
+            last_error = exc
+            continue
+        accepted_edits.append(raw_edit)
+        validated = candidate_plan
+
+    if validated is None:
+        if last_error is not None:
+            raise last_error
+        raise ResumeTailoringError("No safe resume optimization edits remained after validation.")
+
+    final_plan = dict(raw_plan)
+    final_plan["edits"] = accepted_edits
+    return validate_bullet_rewrite_plan(final_plan, job, bullets, resume_text)

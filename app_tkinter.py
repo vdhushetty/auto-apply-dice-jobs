@@ -45,7 +45,7 @@ from core.main_script import (
 )
 from core.resumes import ResumeService, inspect_resume_catalog
 from core.resumes.models import CloudProfile, ResumeError
-from scripts.run_role_ordered import run as run_role_ordered
+from scripts.run_role_ordered import ROLE_SEARCH_ORDER, run as run_role_ordered
 
 AI_REVIEW_POLICY_LABELS = {
     "review_before_apply": "Review before apply",
@@ -287,14 +287,7 @@ class DiceAutoBotApp:
         load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
         # Default values
-        self.search_queries = [
-            "AI ML",
-            "Gen AI",
-            "Agentic AI",
-            "Data Engineer",
-            "Data Analyst",
-            "Machine Learning",
-        ]
+        self.search_queries = list(ROLE_SEARCH_ORDER)
         self.exclude_keywords = [
             "Manager",
             "Director",
@@ -410,7 +403,7 @@ class DiceAutoBotApp:
             ai_review_policy = self.selected_ai_review_policy()
             if self.resume_mode_var.get() == "ai_bullets" and not ai_review_policy:
                 raise ValueError(
-                    "Choose Review before apply or Skip review before saving AI bullet settings."
+                    "Choose Review before apply or Skip review before saving AI optimization settings."
                 )
             config = {
                 "search_queries": [
@@ -988,8 +981,8 @@ How to Use This Application
 1. Enter your Dice.com login credentials in the Settings tab and test them
 2. Enter job titles to search for (separated by commas)
 3. Optionally specify include/exclude keywords to filter results
-4. Configure either three cloud resumes or one base DOCX for AI bullet tailoring
-5. For AI bullet mode, choose Review before apply or Skip review before starting
+4. Configure either three cloud resumes or one base DOCX for whole-resume AI optimization
+5. For AI optimization, choose Review before apply or Skip review before starting
 6. Run Preview first; it never clicks Apply
 7. Verify Upload checks one highest-ranked match and stops before Next or Submit
 8. Use Submit only after reviewing preview results
@@ -999,7 +992,7 @@ Understanding Keywords
 
 Include Keywords: Jobs must contain at least one of these words in the title
 Exclude Keywords: Jobs containing any of these words will be skipped
-Resume Match: Static and tailored modes skip jobs below the configured score. AI bullet
+Resume Match: Static and tailored modes skip jobs below the configured score. AI resume
 tailoring records the initial score but curates from the full job description instead.
 
 Finding Results
@@ -1074,14 +1067,15 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             self.validate_resumes_button.config(text="Validate Base Resume")
             self.resume_mode_help_label.config(
                 text=(
-                    "AI bullet tailoring uses one DOCX, rewrites only supported experience "
-                    "bullets, and preserves non-target structure and page count. Choose the "
-                    "AI review policy before starting automation."
+                    "AI resume optimization targets supported summary, skills, experience, "
+                    "and project text in place while preserving paragraph order, formatting, "
+                    "document structure, and page count. Choose the AI review policy before "
+                    "starting automation."
                 )
             )
             if self.ai_resume_path_var.get().strip().lower().endswith(".pdf"):
                 self.ai_resume_path_var.set("")
-                messagebox.showwarning("DOCX Required", "AI bullet tailoring requires DOCX.")
+                messagebox.showwarning("DOCX Required", "AI resume optimization requires DOCX.")
             return
 
         for row in self.resume_path_rows.values():
@@ -1128,11 +1122,11 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             help_text = "Every generated DOCX opens for your approval before it can be uploaded."
         elif policy == "skip_review":
             help_text = (
-                "Skips only human inspection of generated bullets. Evidence, structure, "
+                "Skips only human inspection of the optimized resume. Evidence, structure, "
                 "layout, matching, and upload-integrity checks still run."
             )
         else:
-            help_text = "Choose a review policy before starting AI bullet automation."
+            help_text = "Choose a review policy before starting AI resume optimization."
         self.ai_review_policy_help_label.config(text=help_text)
 
     def browse_resume_file(self, profile):
@@ -1154,7 +1148,7 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             self.resume_path_vars[profile].set(selected)
 
     def browse_ai_resume_file(self):
-        """Select the one DOCX source used by AI bullet tailoring."""
+        """Select the one DOCX source used by AI resume optimization."""
 
         selected = filedialog.askopenfilename(
             title="Select base DOCX resume",
@@ -1170,21 +1164,22 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             try:
                 from docx import Document
 
-                from core.resumes.bullet_documents import collect_editable_bullets
+                from core.resumes.bullet_documents import collect_editable_resume_items
                 from core.resumes.documents import validate_resume_path
 
                 path = validate_resume_path(self.ai_resume_path_var.get().strip(), tailored=True)
-                bullets = collect_editable_bullets(Document(str(path)))
-                if not bullets:
+                editable_items = collect_editable_resume_items(Document(str(path)))
+                if not editable_items:
                     raise ResumeError(
-                        "No safely editable experience bullets were found in the base DOCX."
+                        "No safely editable resume content was found in the base DOCX."
                     )
             except (ResumeError, ValueError, OSError) as exc:
                 messagebox.showerror("Resume Validation", str(exc))
                 return
             messagebox.showinfo(
                 "Resume Validation",
-                f"Base DOCX is AI-ready with {len(bullets)} editable experience bullets.",
+                "Base DOCX is AI-ready with "
+                f"{len(editable_items)} structure-preserving editable items.",
             )
             return
 
@@ -1418,12 +1413,12 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             )
             lines.append("")
         if record.changes:
-            lines.append("Validated resume bullet changes:")
+            lines.append("Validated resume changes:")
             for change in record.changes:
                 lines.append(f"• {change.bullet_id} replaced with:")
                 lines.extend(f"  – {bullet}" for bullet in change.replacement_bullets)
         elif record.resume_filename:
-            lines.append("No AI bullet rewrite manifest was found for this resume.")
+            lines.append("No AI resume optimization manifest was found for this resume.")
         else:
             lines.append("No resume was uploaded because this job was skipped or failed first.")
         self._set_dashboard_details("\n".join(lines))
@@ -1778,9 +1773,10 @@ Confirmed submissions are also appended to applied_jobs.xlsx.
             ),
             RunMode.SUBMIT: (
                 "Confirm External Submissions",
-                "Score a bounded, diverse job sample by full descriptions, then submit "
-                f"up to {job_limit} highest-fit applications using "
-                f"{resume_settings['resume_mode']} resume mode. Continue?",
+                "Process Dice search results one at a time in this fixed role order: "
+                f"{', '.join(ROLE_SEARCH_ORDER)}. For each role, submit up to {job_limit} "
+                "confirmed applications in result order; each job is read, optimized, uploaded, "
+                "and completed before the next result opens. Continue?",
             ),
         }[run_mode]
         if resume_settings["resume_mode"] == "ai_bullets":
